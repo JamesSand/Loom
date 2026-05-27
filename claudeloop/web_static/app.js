@@ -1,20 +1,25 @@
 /**
- * claudeloop .RUD web client.
+ * claudeloop web client.
+ *
+ * Three tabs now: Interview, PLAN.md, NOTES.md. All worker/runner/evaluator
+ * and worktree machinery has been removed from the backend; this client
+ * only talks to /api/projects, /api/tasks, /api/tmux/*, /api/interview/*,
+ * and template GET/PUT for PLAN.md / NOTES.md.
  */
+
 const FILES = {
   plan: 'PLAN.md',
-  task: 'TASK_PROMPT.md',
-  success: 'SUCCESS_CONDITION.md',
   interview: 'INTERVIEW.md',
 };
 
+// "claude" is the tmux pane tab (with the live claude session);
+// "interview" is the INTERVIEW.md markdown editor that sits inside it.
+// Both belong to the active task.
+const MARKDOWN_PANELS = ['interview', 'plan'];
+
 const TABS = [
-  { id: 'interview', label: 'Interview' },
+  { id: 'claude', label: 'Claude' },
   { id: 'plan', label: 'PLAN.md' },
-  { id: 'task', label: 'TASK_PROMPT.md' },
-  { id: 'success', label: 'SUCCESS_CONDITION.md' },
-  { id: 'panes', label: 'Runner / Evaluator' },
-  { id: 'worker', label: 'Worker' },
 ];
 const DEFAULT_TAB = TABS[0].id;
 
@@ -25,20 +30,21 @@ const STATE = {
   tasks: [],
   launchRoot: '',
   launchRootChildren: [],
-  firstInterview: true,
   paneTimer: null,
   activePanel: TABS[0].id,
   previewCache: {},
   previewDebounce: {},
   sidebarOpen: false,
+  notesDirty: false,
+  notesSaving: false,
+  planDirty: false,
+  taskFilter: '',
 };
 
 let PROJECT_DRAG_ID = '';
 let PROJECT_JUST_DRAGGED = false;
 let TASK_DRAG_SLUG = '';
 let TASK_JUST_DRAGGED = false;
-let WORKTREE_SELECTION = null;
-const WORKER_REPO = 'work-root';
 
 function withProjectQuery(path) {
   if (!STATE.projectId) return path;
@@ -53,17 +59,10 @@ async function apiNoProject(path, opts = {}) {
   if (opts.body !== undefined && !headers['Content-Type']) {
     headers['Content-Type'] = 'application/json';
   }
-  const res = await fetch(path, {
-    ...opts,
-    headers,
-  });
+  const res = await fetch(path, { ...opts, headers });
   const text = await res.text();
   let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { error: text };
-  }
+  try { data = JSON.parse(text); } catch { data = { error: text }; }
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
 }
@@ -74,24 +73,17 @@ async function api(path, opts = {}) {
   if (opts.body !== undefined && !headers['Content-Type']) {
     headers['Content-Type'] = 'application/json';
   }
-  const res = await fetch(url, {
-    ...opts,
-    headers,
-  });
+  const res = await fetch(url, { ...opts, headers });
   const text = await res.text();
   let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { error: text };
-  }
+  try { data = JSON.parse(text); } catch { data = { error: text }; }
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
 }
 
-function $(sel) {
-  return document.querySelector(sel);
-}
+function $(sel) { return document.querySelector(sel); }
+
+// ===== Tabs =====
 
 function showPanel(id) {
   document.querySelectorAll('.tab').forEach((t) => {
@@ -103,14 +95,16 @@ function showPanel(id) {
     p.hidden = !on;
   });
   STATE.activePanel = id;
-  // Render the now-visible preview (cheap, cached) and defer any network
-  // fetches so the panel switch itself feels instant.
-  if (['plan', 'task', 'success', 'interview'].includes(id)) {
-    updateMarkdownPreview(id);
+  if (id === 'plan') {
+    updateMarkdownPreview('plan');
+    deferIdle(refreshTaskTemplates);
+  } else if (id === 'claude') {
+    // The Claude tab embeds the INTERVIEW.md preview at the bottom.
+    updateMarkdownPreview('interview');
+    deferIdle(refreshInterviewPreview);
+    deferIdle(refreshTaskTemplates);
+    deferIdle(refreshClaudeSessions);
   }
-  if (['plan', 'task', 'success'].includes(id)) deferIdle(refreshTaskTemplates);
-  if (id === 'interview') deferIdle(refreshInterviewPreview);
-  if (id === 'panes') deferIdle(refreshPanePreview);
 }
 
 function deferIdle(fn) {
@@ -130,12 +124,12 @@ function buildTabs() {
     b.className = 'tab' + (t.id === DEFAULT_TAB ? ' active' : '');
     b.dataset.tab = t.id;
     b.textContent = t.label;
-    b.addEventListener('click', () => {
-      showPanel(t.id);
-    });
+    b.addEventListener('click', () => showPanel(t.id));
     nav.appendChild(b);
   }
 }
+
+// ===== Projects =====
 
 async function loadProjectsList() {
   const d = await apiNoProject('/api/projects');
@@ -418,6 +412,8 @@ async function loadTmuxSessions() {
   }
 }
 
+// ===== Markdown rendering =====
+
 const HTML_ESCAPE_MAP = {
   '&': '&amp;',
   '<': '&lt;',
@@ -451,26 +447,17 @@ function renderMarkdown(md) {
     out.push(`<p>${renderInlineMarkdown(paragraph.join(' '))}</p>`);
     paragraph = [];
   }
-
   function flushList() {
     if (!listType) return;
     out.push(`</${listType}>`);
     listType = null;
   }
-
   function isTableSeparator(line) {
     return /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
   }
-
   function parseTableRow(line) {
-    return line
-      .trim()
-      .replace(/^\|/, '')
-      .replace(/\|$/, '')
-      .split('|')
-      .map((cell) => cell.trim());
+    return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
   }
-
   function renderTable(headers, rows) {
     const head = headers.map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`).join('');
     const body = rows
@@ -490,20 +477,17 @@ function renderMarkdown(md) {
       }
       continue;
     }
-
     if (/^```/.test(line.trim())) {
       flushParagraph();
       flushList();
       codeLines = [];
       continue;
     }
-
     if (!line.trim()) {
       flushParagraph();
       flushList();
       continue;
     }
-
     if (line.includes('|') && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
       flushParagraph();
       flushList();
@@ -518,7 +502,6 @@ function renderMarkdown(md) {
       out.push(renderTable(headers, rows));
       continue;
     }
-
     const heading = line.match(/^(#{1,3})\s+(.+)$/);
     if (heading) {
       flushParagraph();
@@ -526,31 +509,20 @@ function renderMarkdown(md) {
       out.push(`<h${heading[1].length}>${renderInlineMarkdown(heading[2])}</h${heading[1].length}>`);
       continue;
     }
-
     const unordered = line.match(/^\s*[-*]\s+(.+)$/);
     if (unordered) {
       flushParagraph();
-      if (listType !== 'ul') {
-        flushList();
-        listType = 'ul';
-        out.push('<ul>');
-      }
+      if (listType !== 'ul') { flushList(); listType = 'ul'; out.push('<ul>'); }
       out.push(`<li>${renderInlineMarkdown(unordered[1])}</li>`);
       continue;
     }
-
     const ordered = line.match(/^\s*\d+\.\s+(.+)$/);
     if (ordered) {
       flushParagraph();
-      if (listType !== 'ol') {
-        flushList();
-        listType = 'ol';
-        out.push('<ol>');
-      }
+      if (listType !== 'ol') { flushList(); listType = 'ol'; out.push('<ol>'); }
       out.push(`<li>${renderInlineMarkdown(ordered[1])}</li>`);
       continue;
     }
-
     const quote = line.match(/^>\s?(.+)$/);
     if (quote) {
       flushParagraph();
@@ -558,10 +530,8 @@ function renderMarkdown(md) {
       out.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`);
       continue;
     }
-
     paragraph.push(line.trim());
   }
-
   if (codeLines) out.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
   flushParagraph();
   flushList();
@@ -578,13 +548,9 @@ function updateMarkdownPreview(which, force = false) {
   preview.innerHTML = renderMarkdown(text);
 }
 
-// Refresh whichever markdown preview is currently visible.  Inactive panels
-// re-render lazily the next time `showPanel` activates them.
 function updateActiveMarkdownPreview() {
   const which = STATE.activePanel;
-  if (['plan', 'task', 'success', 'interview'].includes(which)) {
-    updateMarkdownPreview(which);
-  }
+  if (MARKDOWN_PANELS.includes(which)) updateMarkdownPreview(which);
 }
 
 function invalidatePreviewCache() {
@@ -592,7 +558,7 @@ function invalidatePreviewCache() {
 }
 
 function initMarkdownPreviews() {
-  ['plan', 'task', 'success', 'interview'].forEach((which) => {
+  MARKDOWN_PANELS.forEach((which) => {
     const editor = $(`#editor-${which}`);
     if (!editor) return;
     editor.addEventListener('input', () => {
@@ -639,22 +605,13 @@ function setMarkdownView(wb, view) {
     b.setAttribute('aria-selected', on ? 'true' : 'false');
   });
   if (view === 'preview') {
-    // Make sure the preview is fresh when switching to it; the input handler
-    // may have skipped rendering while the pane was hidden on narrow screens.
     const which = STATE.activePanel;
-    if (['plan', 'task', 'success', 'interview'].includes(which)) {
-      updateMarkdownPreview(which, true);
-    }
+    if (MARKDOWN_PANELS.includes(which)) updateMarkdownPreview(which, true);
   }
 }
 
 function previewTitle(which) {
-  const names = {
-    plan: 'PLAN.md',
-    task: 'TASK_PROMPT.md',
-    success: 'SUCCESS_CONDITION.md',
-    interview: 'INTERVIEW.md',
-  };
+  const names = { plan: 'PLAN.md', notes: 'NOTES.md', interview: 'INTERVIEW.md' };
   const taskTitle = $('#task-title')?.textContent?.trim() || 'Task';
   return `${names[which] || 'Preview'} · ${taskTitle}`;
 }
@@ -678,9 +635,7 @@ async function openFullscreenPreview(which) {
   });
   try {
     if (card.requestFullscreen && !document.fullscreenElement) await card.requestFullscreen();
-  } catch {
-    // Browsers may block fullscreen if the gesture was not accepted; the modal still works.
-  }
+  } catch { /* fullscreen may be blocked */ }
 }
 
 async function closeFullscreenPreview() {
@@ -689,28 +644,37 @@ async function closeFullscreenPreview() {
   modal.hidden = true;
   document.body.classList.remove('preview-open');
   if (document.fullscreenElement) {
-    try {
-      await document.exitFullscreen();
-    } catch {
-      // Ignore fullscreen teardown errors.
-    }
+    try { await document.exitFullscreen(); } catch { /* ignore */ }
   }
 }
 
 function printFullscreenPreview() {
   const modal = $('#preview-modal');
   if (!modal || modal.hidden) return;
-  window.print();
+  // Some browsers print the wrong viewport when triggered from within
+  // requestFullscreen(); drop fullscreen first, let layout settle, then
+  // print.  Two RAFs are enough for Chrome/Firefox to lay out the @media
+  // print rules before window.print() snapshots them.
+  const fire = () => {
+    requestAnimationFrame(() => requestAnimationFrame(() => window.print()));
+  };
+  if (document.fullscreenElement) {
+    document.exitFullscreen().then(fire, fire);
+  } else {
+    fire();
+  }
 }
 
 function initFullscreenPreviews() {
-  ['plan', 'task', 'success', 'interview'].forEach((which) => {
+  MARKDOWN_PANELS.forEach((which) => {
     const preview = $(`#preview-${which}`);
     if (!preview) return;
     preview.title = 'Double-click to open fullscreen preview';
     preview.addEventListener('dblclick', () => openFullscreenPreview(which));
   });
 }
+
+// ===== Tasks =====
 
 async function loadTasks() {
   STATE.tasks = [];
@@ -759,11 +723,23 @@ function renderTasksFromState() {
   if (!ul) return;
   const selected = STATE.slug;
   ul.innerHTML = '';
-  const tasks = STATE.tasks || [];
+  const all = STATE.tasks || [];
+  const filter = (STATE.taskFilter || '').trim().toLowerCase();
+  const tasks = filter
+    ? all.filter((t) => `${t.title || ''} ${t.slug || ''}`.toLowerCase().includes(filter))
+    : all;
+  const countEl = document.getElementById('task-count');
+  if (countEl) {
+    countEl.textContent = filter && all.length !== tasks.length
+      ? `${tasks.length}/${all.length}`
+      : (all.length ? String(all.length) : '');
+  }
   if (!tasks.length) {
     const li = document.createElement('li');
     li.className = 'task-list__empty';
-    li.textContent = STATE.projectId ? 'No tasks yet' : 'Select or add a project';
+    if (!STATE.projectId) li.textContent = 'Select or add a project';
+    else if (filter) li.textContent = `No tasks match "${filter}"`;
+    else li.textContent = 'No tasks yet';
     ul.appendChild(li);
     return;
   }
@@ -818,20 +794,17 @@ function renderTasksFromState() {
 
 function clearTaskSelection() {
   STATE.slug = null;
-  STATE.firstInterview = true;
   if (STATE.paneTimer) {
     clearInterval(STATE.paneTimer);
     STATE.paneTimer = null;
   }
   document.querySelectorAll('#task-list li').forEach((li) => li.classList.remove('active'));
-  $('#worktree-status').textContent = '';
   $('#task-view').hidden = true;
   $('#task-empty').hidden = false;
 }
 
 async function selectTask(slug) {
   STATE.slug = slug;
-  STATE.firstInterview = true;
   document.querySelectorAll('#task-list li').forEach((li) => {
     li.classList.toggle('active', li.dataset.slug === slug);
   });
@@ -840,31 +813,22 @@ async function selectTask(slug) {
   $('#task-view').hidden = false;
   $('#task-title').textContent = d.meta.title || slug;
   $('#task-slug').textContent = d.meta.slug;
-  $('#task-backend').textContent = `interview: ${d.meta.interview_backend || 'cli'} · model: ${d.meta.interview_model || ''}`;
+  $('#task-backend').textContent = `model: ${d.meta.interview_model || ''}`;
   $('#task-goal').textContent = d.meta.general_goal || '';
-  $('#worktree-status').textContent = '';
   $('#editor-plan').value = d.templates[FILES.plan] || '';
-  $('#editor-task').value = d.templates[FILES.task] || '';
-  $('#editor-success').value = d.templates[FILES.success] || '';
   $('#editor-interview').value = d.interview || '';
   invalidatePreviewCache();
   updateActiveMarkdownPreview();
   $('#inp-interview-target').value = d.meta.tmux_interview_target || '';
-  $('#inp-runner-target').value = d.meta.tmux_runner_target || '';
-  $('#inp-eval-target').value = d.meta.tmux_evaluator_target || '';
-  $('#interview-target-label').textContent = d.meta.tmux_interview_target || 'Not started';
-  $('#runner-target-label').textContent = d.meta.tmux_runner_target || 'Not started';
-  $('#eval-target-label').textContent = d.meta.tmux_evaluator_target || 'Not started';
   $('#interview-out').textContent = d.meta.tmux_interview_target
-    ? 'Loading interview pane…'
-    : (d.interview || 'Click Start deep-interview to launch the Claude Code interview pane.');
-  fillRepos(d.work_repos || [], d.meta.work_dirs || []);
-  updateWorktreeStatusList(d.work_repos || []);
+    ? 'Loading Claude pane…'
+    : (d.interview || 'Click Start Claude to launch a tmux pane in the worktree.');
+  renderClaudeInfo(d.meta, d.claude || null, d.worktree_statuses || []);
+  resetPlanDirty();
   buildTabs();
   showPanel(DEFAULT_TAB);
-  await refreshLog();
   refreshInterviewPreview();
-  refreshPanePreview();
+  refreshClaudeSessions();
   startPanePolling();
 }
 
@@ -874,7 +838,7 @@ async function deleteSelectedTask() {
   const title = $('#task-title')?.textContent || slug;
   const ok = confirm(
     `Delete task "${title}" (${slug})?\n\n` +
-    `This permanently removes .RUD/${slug}/, including task files, worktrees, runs, and logs. ` +
+    `This permanently removes .RUD/${slug}/, including PLAN.md, NOTES.md, INTERVIEW.md, and task metadata. ` +
     `Running tmux sessions are not stopped automatically.`
   );
   if (!ok) return;
@@ -897,13 +861,8 @@ async function refreshTaskTemplates() {
   const d = await api('/api/tasks/' + encodeURIComponent(STATE.slug));
   const next = {
     plan: d.templates[FILES.plan] || '',
-    task: d.templates[FILES.task] || '',
-    success: d.templates[FILES.success] || '',
     interview: d.interview || '',
   };
-  // Avoid clobbering the textarea (and breaking IME composition / scroll
-  // position) when nothing actually changed on disk, or when the user is
-  // mid-typing into that very editor.
   const active = document.activeElement;
   let changed = false;
   for (const which of Object.keys(next)) {
@@ -917,24 +876,7 @@ async function refreshTaskTemplates() {
     }
   }
   if (changed) updateActiveMarkdownPreview();
-}
-
-function fillRepos(workRepos, workDirs) {
-  // Worktree list is displayed in the status row; worker runs from the work root.
-}
-
-function updateWorktreeStatusList(workRepos) {
-  const status = $('#worktree-status');
-  if (!status) return;
-  const names = Array.isArray(workRepos) ? workRepos : [];
-  if (!names.length) {
-    status.textContent = 'No worktrees created yet.';
-    status.title = '';
-    return;
-  }
-  const text = `Created worktrees: ${names.join(', ')}`;
-  status.textContent = text;
-  status.title = names.join('\n');
+  if (d.meta) renderClaudeInfo(d.meta, d.claude || null, d.worktree_statuses || []);
 }
 
 async function saveTemplate(name, textareaId, statusId) {
@@ -950,30 +892,7 @@ async function saveTemplate(name, textareaId, statusId) {
   }
 }
 
-async function refreshPanePreview() {
-  const rT = $('#inp-runner-target').value.trim();
-  const eT = $('#inp-eval-target').value.trim();
-  const preR = $('#pre-runner');
-  const preE = $('#pre-eval');
-  if (!rT) preR.textContent = '(runner not bound)';
-  else {
-    try {
-      const d = await api('/api/tmux/capture?target=' + encodeURIComponent(rT) + '&lines=100');
-      preR.textContent = d.ok ? d.text : d.error || '(error)';
-    } catch (err) {
-      preR.textContent = err.message;
-    }
-  }
-  if (!eT) preE.textContent = '(evaluator not bound)';
-  else {
-    try {
-      const d = await api('/api/tmux/capture?target=' + encodeURIComponent(eT) + '&lines=100');
-      preE.textContent = d.ok ? d.text : d.error || '(error)';
-    } catch (err) {
-      preE.textContent = err.message;
-    }
-  }
-}
+// ===== Interview pane (tmux) =====
 
 async function refreshInterviewPreview() {
   const target = $('#inp-interview-target').value.trim();
@@ -987,25 +906,13 @@ async function refreshInterviewPreview() {
   }
 }
 
-function paneTarget(which) {
-  if (which === 'runner') return $('#inp-runner-target').value.trim();
-  if (which === 'eval') return $('#inp-eval-target').value.trim();
-  return $('#inp-interview-target').value.trim();
-}
-
-function paneInput(which) {
-  if (which === 'runner') return $('#pane-runner-input');
-  if (which === 'eval') return $('#pane-eval-input');
-  return $('#interview-in');
-}
-
-async function sendPaneText(which, submit = false) {
-  const target = paneTarget(which);
+async function sendPaneText(submit = false) {
+  const target = $('#inp-interview-target').value.trim();
   if (!target) {
-    alert(`Bind the ${which} pane first.`);
+    alert('Start the interview pane first.');
     return;
   }
-  const input = paneInput(which);
+  const input = $('#interview-in');
   const text = input.value;
   if (!text && !submit) return;
   await api('/api/tmux/send-text', {
@@ -1013,244 +920,51 @@ async function sendPaneText(which, submit = false) {
     body: JSON.stringify({ target, text, submit }),
   });
   input.value = '';
-  if (which === 'interview') await refreshInterviewPreview();
-  else await refreshPanePreview();
+  await refreshInterviewPreview();
 }
 
-async function sendPaneKey(which, key) {
-  const target = paneTarget(which);
+async function sendPaneKey(key) {
+  const target = $('#inp-interview-target').value.trim();
   if (!target) {
-    alert(`Bind the ${which} pane first.`);
+    alert('Start the interview pane first.');
     return;
   }
   await api('/api/tmux/send-key', {
     method: 'POST',
     body: JSON.stringify({ target, key }),
   });
-  if (which === 'interview') await refreshInterviewPreview();
-  else await refreshPanePreview();
+  await refreshInterviewPreview();
 }
 
 function startPanePolling() {
   if (STATE.paneTimer) clearInterval(STATE.paneTimer);
   STATE.paneTimer = setInterval(() => {
     if (!STATE.slug) return;
-    const pan = document.querySelector('.tab-panel[data-panel="panes"]');
-    if (pan && !pan.hidden) refreshPanePreview();
-    const interview = document.querySelector('.tab-panel[data-panel="interview"]');
-    if (interview && !interview.hidden) {
+    const claudeTab = document.querySelector('.tab-panel[data-panel="claude"]');
+    if (claudeTab && !claudeTab.hidden) {
       refreshInterviewPreview();
       refreshTaskTemplates();
+      refreshClaudeSessions();
     }
-    const worker = document.querySelector('.tab-panel[data-panel="worker"]');
-    if (worker && !worker.hidden) refreshLog();
   }, 4000);
 }
 
-async function refreshLog() {
+async function startInterviewPane() {
   if (!STATE.slug) return;
-  const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/worker/log?' + new URLSearchParams({ repo: WORKER_REPO }));
-  $('#log-pre').textContent = r.tail || '(no output)';
-  updateWorkerStatus(r.status || {});
+  showPanel('interview');
+  $('#interview-out').textContent = 'Starting Claude Code interview pane…\nPrompt will be pasted automatically in about 5 seconds.';
+  const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/interview/start', {
+    method: 'POST',
+    body: '{}',
+  });
+  $('#inp-interview-target').value = r.target || '';
+  $('#interview-target-label').textContent = r.target || 'Not started';
+  await refreshInterviewPreview();
+  setTimeout(refreshInterviewPreview, 6500);
+  setTimeout(refreshInterviewPreview, 10000);
 }
 
-function updateWorkerStatus(status) {
-  const card = document.getElementById('worker-status-card');
-  const session = status.session || {};
-  const running = Boolean(status.running);
-  const saved = String(session.status || '').toLowerCase();
-  const completed = Number(session.completed_iteration || 0);
-  const maxRounds = Number(session.max_rounds || 0);
-  const current = Number(session.current_round || (running && maxRounds ? completed + 1 : completed));
-
-  let phase = 'idle';
-  let label = 'Idle';
-  if (running) {
-    phase = 'running';
-    label = 'Running';
-  } else if (saved === 'running') {
-    phase = 'stopped';
-    label = 'Stopped';
-  } else if (saved === 'success') {
-    phase = 'complete';
-    label = 'Complete';
-  } else if (saved === 'failed') {
-    phase = 'failed';
-    label = 'Failed';
-  } else if (saved === 'error') {
-    phase = 'error';
-    label = 'Error';
-  } else if (saved === 'paused') {
-    phase = 'paused';
-    label = 'Paused';
-  } else if (saved && saved !== 'idle' && saved !== 'unknown') {
-    label = saved.charAt(0).toUpperCase() + saved.slice(1);
-  }
-
-  let pct = maxRounds ? Math.max(0, Math.min(100, (completed / maxRounds) * 100)) : 0;
-  if (saved === 'success' || phase === 'complete') {
-    pct = 100;
-  }
-
-  const badge = $('#worker-status-text');
-  if (badge) {
-    badge.textContent = label;
-    badge.className = `worker-status-badge worker-status-badge--${phase}`;
-  }
-  if (card) {
-    card.dataset.workerPhase = phase;
-  }
-
-  $('#worker-status-meta').textContent = status.pid
-    ? `pid ${status.pid}${session.updated_at ? ' · updated ' + session.updated_at : ''}`
-    : 'No controller process found.';
-  $('#worker-round-text').textContent = maxRounds
-    ? `Round ${Math.min(current, maxRounds)} / ${maxRounds} · completed ${completed}`
-    : 'Round - / -';
-
-  const bar = $('#worker-progress-bar');
-  const wrap = document.getElementById('worker-progress');
-  if (bar) {
-    bar.style.width = `${pct}%`;
-    bar.classList.toggle('worker-progress__bar--done', phase === 'complete');
-    bar.classList.toggle('worker-progress__bar--bad', phase === 'failed' || phase === 'error');
-  }
-  if (wrap) {
-    wrap.classList.toggle('worker-progress--done', phase === 'complete');
-    wrap.classList.toggle('worker-progress--bad', phase === 'failed' || phase === 'error');
-  }
-}
-
-function formatWorktreeResults(results) {
-  const rows = Array.isArray(results) ? results : [];
-  const okCount = rows.filter((x) => x && x.ok).length;
-  const failCount = rows.length - okCount;
-  const summary = failCount
-    ? `Worktree: ${okCount} ok, ${failCount} failed`
-    : `Worktree ready: ${okCount}`;
-  const detail = rows.map((r) => {
-    const repo = r.repo_key || r.work_dir || '(unknown repo)';
-    const status = r.ok ? 'ok' : 'failed';
-    const reason = r.reason ? ` — ${r.reason}` : '';
-    const path = r.worktree ? ` (${r.worktree})` : '';
-    return `${status}: ${repo}${path}${reason}`;
-  }).join('\n');
-  return { summary, detail, failCount };
-}
-
-async function createWorktrees(workDirs = null) {
-  if (!STATE.slug) return;
-  const status = $('#worktree-status');
-  status.textContent = 'Creating worktree…';
-  status.title = '';
-  const opts = { method: 'POST', body: workDirs ? JSON.stringify({ work_dirs: workDirs }) : '{}' };
-  const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/worktrees', opts);
-  const d = await api('/api/tasks/' + encodeURIComponent(STATE.slug));
-  fillRepos(d.work_repos || [], d.meta.work_dirs || []);
-  updateWorktreeStatusList(d.work_repos || []);
-  const formatted = formatWorktreeResults(r.results || []);
-  status.textContent = `${status.textContent} · ${formatted.summary}`;
-  status.title = [status.title, formatted.detail].filter(Boolean).join('\n\n');
-  if (formatted.failCount) {
-    alert(`${formatted.summary}\n\n${formatted.detail}`);
-  }
-}
-
-async function openWorktreeSelectionIfNeeded() {
-  if (!STATE.slug) return;
-  const status = $('#worktree-status');
-  status.textContent = 'Checking repositories…';
-  status.title = '';
-  const candidates = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/worktree-candidates');
-  if (candidates.needsSelection) {
-    const d = await api('/api/tasks/' + encodeURIComponent(STATE.slug));
-    updateWorktreeStatusList(d.work_repos || []);
-    openWorktreeSelectModal(candidates);
-    return;
-  }
-  await createWorktrees();
-}
-
-function openWorktreeSelectModal(candidates) {
-  WORKTREE_SELECTION = candidates || {};
-  const modal = $('#worktree-select-modal');
-  const list = $('#worktree-select-list');
-  const status = $('#worktree-select-status');
-  list.innerHTML = '';
-  status.textContent = '';
-  for (const group of (WORKTREE_SELECTION.groups || [])) {
-    const box = document.createElement('div');
-    box.className = 'worktree-select-group';
-    const title = document.createElement('h3');
-    title.textContent = group.workDir || '(unknown directory)';
-    box.appendChild(title);
-    if (group.kind === 'repo') {
-      const p = document.createElement('p');
-      p.className = 'modal-subhint';
-      p.textContent = `Git repo: ${(group.repos && group.repos[0] && group.repos[0].name) || group.workDir}. This will be created automatically.`;
-      box.appendChild(p);
-    } else if (!group.repos || !group.repos.length) {
-      const p = document.createElement('p');
-      p.className = 'modal-subhint status-bad';
-      p.textContent = group.reason || 'No direct child git repositories found.';
-      box.appendChild(p);
-    } else {
-      const p = document.createElement('p');
-      p.className = 'modal-subhint';
-      p.textContent = 'Direct child repos:';
-      box.appendChild(p);
-      for (const repo of group.repos) {
-        const label = document.createElement('label');
-        label.className = 'worktree-select-row';
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.value = repo.path || '';
-        cb.checked = true;
-        cb.dataset.worktreeRepo = '1';
-        const span = document.createElement('span');
-        span.textContent = `${repo.name || repo.repoKey || repo.path} — ${repo.path}`;
-        label.appendChild(cb);
-        label.appendChild(span);
-        box.appendChild(label);
-      }
-    }
-    list.appendChild(box);
-  }
-  modal.hidden = false;
-}
-
-function closeWorktreeSelectModal() {
-  const modal = $('#worktree-select-modal');
-  if (modal) modal.hidden = true;
-  WORKTREE_SELECTION = null;
-}
-
-async function createSelectedWorktrees() {
-  const selected = Array.from(document.querySelectorAll('#worktree-select-list input[data-worktree-repo]:checked'))
-    .map((x) => x.value)
-    .filter(Boolean);
-  const auto = [];
-  for (const group of ((WORKTREE_SELECTION && WORKTREE_SELECTION.groups) || [])) {
-    const repos = group.repos || [];
-    if (group.kind === 'repo' && repos[0] && repos[0].path) auto.push(repos[0].path);
-    else if (group.kind === 'container' && repos.length === 1 && repos[0].path) auto.push(repos[0].path);
-  }
-  const workDirs = Array.from(new Set([...auto, ...selected]));
-  if (!workDirs.length) {
-    $('#worktree-select-status').textContent = 'Select at least one repo.';
-    return;
-  }
-  $('#btn-worktree-select-create').disabled = true;
-  $('#worktree-select-status').textContent = 'Creating…';
-  try {
-    closeWorktreeSelectModal();
-    await createWorktrees(workDirs);
-  } catch (e) {
-    $('#worktree-status').textContent = e.message;
-  } finally {
-    $('#btn-worktree-select-create').disabled = false;
-  }
-}
+// ===== Modals & sidebar =====
 
 function openCreateModal() {
   if (!STATE.projectId) {
@@ -1290,13 +1004,13 @@ function toggleSidebar() {
   setSidebarOpen(!STATE.sidebarOpen);
 }
 
+// ===== Wire-up =====
+
 (function initSidebarToggle() {
   const toggle = document.getElementById('btn-sidebar-toggle');
   if (toggle) toggle.addEventListener('click', toggleSidebar);
   const backdrop = document.getElementById('sidebar-backdrop');
   if (backdrop) backdrop.addEventListener('click', () => setSidebarOpen(false));
-  // When resizing back to desktop, drop the drawer state so the sidebar shows
-  // in its normal docked position.
   window.addEventListener('resize', () => {
     if (!isMobileViewport() && STATE.sidebarOpen) setSidebarOpen(false);
   });
@@ -1312,6 +1026,92 @@ $('#add-project-modal').addEventListener('click', (event) => {
 
 document.getElementById('btn-tmux-refresh').addEventListener('click', loadTmuxSessions);
 document.getElementById('btn-tasks-refresh').addEventListener('click', loadTasks);
+
+(function initTaskFilter() {
+  const inp = document.getElementById('task-filter');
+  if (!inp) return;
+  let timer = 0;
+  inp.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      STATE.taskFilter = inp.value;
+      renderTasksFromState();
+    }, 80);
+  });
+})();
+
+// ===== Inline edit: task title + goal =====
+
+function makeEditable(el, { multiline = false, placeholder = '', onSave }) {
+  if (!el) return;
+  el.classList.add('editable');
+  el.title = 'Click to edit';
+  el.addEventListener('click', (ev) => {
+    if (el.dataset.editing === '1') return;
+    ev.stopPropagation();
+    el.dataset.editing = '1';
+    const current = el.textContent || '';
+    const input = document.createElement(multiline ? 'textarea' : 'input');
+    if (!multiline) input.type = 'text';
+    input.value = current;
+    input.placeholder = placeholder;
+    input.className = 'editable__input';
+    if (multiline) input.rows = 3;
+    el.innerHTML = '';
+    el.appendChild(input);
+    input.focus();
+    if (!multiline) input.select();
+    let done = false;
+    const finish = async (commit) => {
+      if (done) return;
+      done = true;
+      el.dataset.editing = '';
+      const next = input.value.trim();
+      if (!commit || next === current.trim()) {
+        el.textContent = current;
+        return;
+      }
+      el.textContent = next;
+      try { await onSave(next); } catch (err) {
+        el.textContent = current;
+        alert(err.message || 'save failed');
+      }
+    };
+    input.addEventListener('blur', () => finish(true));
+    input.addEventListener('keydown', (kev) => {
+      if (kev.key === 'Escape') { kev.preventDefault(); finish(false); }
+      if (kev.key === 'Enter' && !multiline) { kev.preventDefault(); finish(true); }
+      if (kev.key === 'Enter' && (kev.ctrlKey || kev.metaKey) && multiline) {
+        kev.preventDefault(); finish(true);
+      }
+    });
+  });
+}
+
+async function saveTaskMeta(patch) {
+  if (!STATE.slug) return;
+  const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/meta', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  });
+  if (r.meta) {
+    // Update the local task list cache so the sidebar reflects the change.
+    STATE.tasks = (STATE.tasks || []).map((t) => (t.slug === r.meta.slug ? r.meta : t));
+    renderTasksFromState();
+  }
+}
+
+(function initTaskHeaderEditing() {
+  makeEditable($('#task-title'), {
+    placeholder: 'Task title',
+    onSave: (title) => saveTaskMeta({ title }),
+  });
+  makeEditable($('#task-goal'), {
+    multiline: true,
+    placeholder: 'General goal',
+    onSave: (general_goal) => saveTaskMeta({ general_goal }),
+  });
+})();
 document.getElementById('btn-create-open').addEventListener('click', openCreateModal);
 document.getElementById('btn-empty-create').addEventListener('click', openCreateModal);
 document.getElementById('btn-create-close').addEventListener('click', closeCreateModal);
@@ -1322,16 +1122,10 @@ document.getElementById('create-modal').addEventListener('click', (event) => {
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
   if (!$('#preview-modal').hidden) closeFullscreenPreview();
+  else if (!$('#notes-modal').hidden) closeNotesModal();
+  else if (!$('#worktree-modal').hidden) closeWorktreeModal();
   else if (!$('#create-modal').hidden) closeCreateModal();
   else if (!$('#add-project-modal').hidden) closeAddProjectModal();
-  else if (!$('#worktree-select-modal').hidden) closeWorktreeSelectModal();
-});
-
-document.getElementById('btn-worktree-select-close').addEventListener('click', closeWorktreeSelectModal);
-document.getElementById('btn-worktree-select-cancel').addEventListener('click', closeWorktreeSelectModal);
-document.getElementById('btn-worktree-select-create').addEventListener('click', createSelectedWorktrees);
-$('#worktree-select-modal').addEventListener('click', (event) => {
-  if (event.target.id === 'worktree-select-modal') closeWorktreeSelectModal();
 });
 
 document.getElementById('btn-preview-close').addEventListener('click', closeFullscreenPreview);
@@ -1341,28 +1135,483 @@ document.getElementById('preview-modal').addEventListener('click', (event) => {
   if (event.target.id === 'preview-modal') closeFullscreenPreview();
 });
 
-document.getElementById('btn-save-plan').addEventListener('click', () => saveTemplate(FILES.plan, '#editor-plan', '#status-plan'));
-document.getElementById('btn-save-task').addEventListener('click', () => saveTemplate(FILES.task, '#editor-task', null));
-document.getElementById('btn-save-success').addEventListener('click', () => saveTemplate(FILES.success, '#editor-success', null));
+// ===== PLAN.md save: dirty indicator + Cmd/Ctrl+S =====
 
-async function startInterviewPane() {
-  if (!STATE.slug) return;
-  showPanel('interview');
-  $('#interview-out').textContent = 'Starting Claude Code interview pane…\nPrompt will be pasted automatically in about 5 seconds.';
-  const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/interview/start', {
-    method: 'POST',
-    body: '{}',
-  });
-  $('#inp-interview-target').value = r.target || '';
-  $('#interview-target-label').textContent = r.target || 'Not started';
-  await refreshInterviewPreview();
-  setTimeout(refreshInterviewPreview, 6500);
-  setTimeout(refreshInterviewPreview, 10000);
+function setPlanDirty(dirty) {
+  STATE.planDirty = !!dirty;
+  const btn = document.getElementById('btn-save-plan');
+  if (!btn) return;
+  btn.classList.toggle('is-dirty', STATE.planDirty);
+  btn.textContent = STATE.planDirty ? 'Save PLAN.md •' : 'Save PLAN.md';
 }
 
-document.getElementById('btn-interview-start').addEventListener('click', async () => {
-  await startInterviewPane();
+function resetPlanDirty() {
+  setPlanDirty(false);
+}
+
+async function savePlanFromEditor() {
+  await saveTemplate(FILES.plan, '#editor-plan', '#status-plan');
+  resetPlanDirty();
+}
+
+(function initPlanEditorSaveUx() {
+  const editor = $('#editor-plan');
+  if (!editor) return;
+  editor.addEventListener('input', () => setPlanDirty(true));
+  editor.addEventListener('keydown', (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && (ev.key === 's' || ev.key === 'S')) {
+      ev.preventDefault();
+      savePlanFromEditor();
+    }
+  });
+})();
+
+document.getElementById('btn-save-plan').addEventListener('click', savePlanFromEditor);
+document.getElementById('btn-worktree-push-all').addEventListener('click', pushAllWorktrees);
+
+// ===== Project NOTES.md modal =====
+
+async function openNotesModal() {
+  if (!STATE.projectId) {
+    alert('Select or add a project first.');
+    return;
+  }
+  const modal = $('#notes-modal');
+  if (!modal) return;
+  modal.hidden = false;
+  document.body.classList.add('preview-open');
+  const editor = $('#editor-notes');
+  const preview = $('#preview-notes');
+  const status = $('#notes-modal-status');
+  const pathEl = $('#notes-modal-path');
+  status.textContent = 'Loading…';
+  editor.disabled = true;
+  try {
+    const project = await api('/api/project');
+    const projectRoot = project.projectRoot || '';
+    if (pathEl) pathEl.textContent = projectRoot ? `${projectRoot}/.RUD/NOTES.md` : '.RUD/NOTES.md';
+    const d = await api('/api/notes');
+    editor.value = d.content || '';
+    preview.innerHTML = renderMarkdown(editor.value);
+    STATE.notesDirty = false;
+    status.textContent = '';
+  } catch (err) {
+    status.textContent = err.message || 'Failed to load notes';
+  } finally {
+    editor.disabled = false;
+    requestAnimationFrame(() => editor.focus());
+  }
+}
+
+function closeNotesModal() {
+  if (STATE.notesDirty && !confirm('Discard unsaved Notes changes?')) return;
+  const modal = $('#notes-modal');
+  if (modal) modal.hidden = true;
+  document.body.classList.remove('preview-open');
+}
+
+async function saveNotes() {
+  const editor = $('#editor-notes');
+  const status = $('#notes-modal-status');
+  if (!editor) return;
+  STATE.notesSaving = true;
+  status.textContent = 'Saving…';
+  try {
+    await api('/api/notes', {
+      method: 'PUT',
+      body: JSON.stringify({ content: editor.value }),
+    });
+    STATE.notesDirty = false;
+    status.textContent = 'Saved';
+    setTimeout(() => { if (status.textContent === 'Saved') status.textContent = ''; }, 1800);
+  } catch (err) {
+    status.textContent = err.message || 'Save failed';
+  } finally {
+    STATE.notesSaving = false;
+  }
+}
+
+(function initNotesModalEditor() {
+  const editor = $('#editor-notes');
+  const preview = $('#preview-notes');
+  if (!editor || !preview) return;
+  editor.addEventListener('input', () => {
+    STATE.notesDirty = true;
+    requestAnimationFrame(() => { preview.innerHTML = renderMarkdown(editor.value); });
+  });
+  editor.addEventListener('keydown', (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && (ev.key === 's' || ev.key === 'S')) {
+      ev.preventDefault();
+      saveNotes();
+    }
+  });
+})();
+
+document.getElementById('btn-notes-open').addEventListener('click', openNotesModal);
+document.getElementById('btn-notes-close').addEventListener('click', closeNotesModal);
+document.getElementById('btn-notes-save').addEventListener('click', saveNotes);
+document.getElementById('notes-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'notes-modal') closeNotesModal();
 });
+
+// ===== Claude pane info card (worktree + session history + Resume) =====
+
+function formatSessionMtime(ts) {
+  if (!ts) return '';
+  try {
+    const d = new Date(ts * 1000);
+    return d.toLocaleString();
+  } catch { return ''; }
+}
+
+function shortSessionId(sid) {
+  const s = String(sid || '');
+  if (s.length <= 12) return s;
+  return s.slice(0, 8);
+}
+
+function renderClaudeInfo(meta, claude, statuses) {
+  meta = meta || {};
+  claude = claude || {};
+  const tmuxEl = $('#claude-info-tmux');
+  const pillEl = $('#claude-info-tmux-state');
+  const sessHost = $('#claude-info-sessions');
+  const wtHost = $('#claude-info-worktree-list');
+  const worktrees = Array.isArray(meta.worktrees) && meta.worktrees.length
+    ? meta.worktrees
+    : (meta.worktree_path ? [meta.worktree_path] : []);
+  const branches = Array.isArray(meta.branches) && meta.branches.length
+    ? meta.branches
+    : (meta.branch ? [meta.branch] : []);
+  const statusByPath = {};
+  for (const s of (Array.isArray(statuses) ? statuses : [])) {
+    if (s && s.path) statusByPath[s.path] = s;
+  }
+  const pushAllBtn = document.getElementById('btn-worktree-push-all');
+  if (pushAllBtn) pushAllBtn.hidden = worktrees.length === 0;
+  if (wtHost) {
+    wtHost.innerHTML = '';
+    if (!worktrees.length) {
+      const hint = document.createElement('span');
+      hint.className = 'claude-info__hint';
+      hint.textContent = '(none — click + Add worktree, or git worktree add manually under .RUD/<slug>/work/)';
+      wtHost.appendChild(hint);
+    } else {
+      worktrees.forEach((path, i) => {
+        const row = document.createElement('div');
+        row.className = 'wt-list-row' + (i === 0 ? ' wt-list-row--primary' : '');
+        const main = document.createElement('div');
+        main.className = 'wt-list-row__main';
+        const pathEl = document.createElement('code');
+        pathEl.className = 'wt-list-row__path';
+        pathEl.textContent = path;
+        if (i === 0) pathEl.title = 'Primary — the Claude pane opens in this worktree';
+        main.appendChild(pathEl);
+        const br = document.createElement('span');
+        br.className = 'wt-list-row__branch';
+        br.textContent = (branches[i] || '').trim() || '—';
+        main.appendChild(br);
+        const st = statusByPath[path];
+        if (st) main.appendChild(renderWorktreeStatusBadge(st));
+        row.appendChild(main);
+        if (i === 0) {
+          const pill = document.createElement('span');
+          pill.className = 'wt-list-row__pill';
+          pill.textContent = 'primary';
+          row.appendChild(pill);
+        }
+        const push = document.createElement('button');
+        push.type = 'button';
+        push.className = 'wt-list-row__push';
+        push.title = `git push -u origin ${(branches[i] || '').trim() || 'branch'}`;
+        push.textContent = 'Push';
+        push.addEventListener('click', () => pushWorktree(path, push));
+        row.appendChild(push);
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'wt-list-row__remove';
+        rm.title = 'Remove this worktree (git worktree remove + delete dir)';
+        rm.setAttribute('aria-label', 'Remove worktree');
+        rm.textContent = '×';
+        rm.addEventListener('click', () => removeWorktree(path));
+        row.appendChild(rm);
+        wtHost.appendChild(row);
+      });
+    }
+  }
+  if (tmuxEl) tmuxEl.textContent = claude.tmux_target || meta.tmux_interview_target || '(not started)';
+  if (pillEl) {
+    const alive = !!claude.tmux_alive;
+    pillEl.textContent = alive ? 'alive' : 'down';
+    pillEl.dataset.state = alive ? 'alive' : 'down';
+  }
+  if (!sessHost) return;
+  sessHost.innerHTML = '';
+  const sessions = Array.isArray(claude.sessions) ? claude.sessions : [];
+  if (!sessions.length) {
+    const span = document.createElement('span');
+    span.className = 'claude-info__hint';
+    span.textContent = 'No Claude sessions captured yet. Start Claude to bind one.';
+    sessHost.appendChild(span);
+    return;
+  }
+  for (const s of sessions) {
+    const row = document.createElement('div');
+    row.className = 'claude-session';
+    row.dataset.sessionId = s.id || '';
+    const idEl = document.createElement('code');
+    idEl.className = 'claude-session__id';
+    idEl.title = s.id || '';
+    idEl.textContent = shortSessionId(s.id);
+    const meta_ = document.createElement('span');
+    meta_.className = 'claude-session__meta';
+    const parts = [];
+    if (s.mtime) parts.push(formatSessionMtime(s.mtime));
+    if (s.size) parts.push(`${Math.max(1, Math.round(s.size / 1024))} KB`);
+    if (!s.path) parts.push('on-disk file not found');
+    meta_.textContent = parts.join(' · ') || '(no on-disk transcript yet)';
+    const resume = document.createElement('button');
+    resume.type = 'button';
+    resume.className = 'btn btn--sm';
+    resume.textContent = 'Resume';
+    resume.disabled = !s.id || (claude.tmux_alive === true);
+    resume.title = claude.tmux_alive
+      ? 'Stop the running Claude pane before resuming a different session.'
+      : 'Launch a fresh tmux pane with claude --resume <id>';
+    resume.addEventListener('click', () => resumeClaudeSession(s.id));
+    row.appendChild(idEl);
+    row.appendChild(meta_);
+    row.appendChild(resume);
+    sessHost.appendChild(row);
+  }
+}
+
+// ===== Worktree picker modal =====
+
+async function openWorktreeModal() {
+  if (!STATE.slug) return;
+  const modal = $('#worktree-modal');
+  if (!modal) return;
+  modal.hidden = false;
+  $('#wt-modal-branch').textContent = `zhongzhu/${STATE.slug}`;
+  $('#wt-modal-dest').textContent = `.RUD/${STATE.slug}/work/<repo>/`;
+  const host = $('#wt-candidates');
+  const status = $('#wt-status');
+  status.textContent = '';
+  host.innerHTML = '<div class="claude-info__hint">Scanning project root for git repos…</div>';
+  try {
+    const d = await api(`/api/tasks/${encodeURIComponent(STATE.slug)}/worktree-candidates`);
+    renderWorktreeCandidates(d.candidates || [], d.projectRoot || '');
+  } catch (err) {
+    host.innerHTML = `<div class="status-bad">${escapeHtml(err.message || 'failed')}</div>`;
+  }
+}
+
+function renderWorktreeCandidates(candidates, projectRoot) {
+  const host = $('#wt-candidates');
+  host.innerHTML = '';
+  if (!candidates.length) {
+    const help = document.createElement('div');
+    help.className = 'claude-info__hint';
+    help.innerHTML = `No git repos found at <code>${escapeHtml(projectRoot)}</code> or its immediate subdirectories. <br>Either register a git-repo path as the project, or <code>git worktree add</code> manually into <code>.RUD/${escapeHtml(STATE.slug)}/work/</code> and reopen the Claude tab.`;
+    host.appendChild(help);
+    return;
+  }
+  for (const c of candidates) {
+    const row = document.createElement('div');
+    row.className = 'wt-candidate' + (c.already_created ? ' wt-candidate--done' : '');
+    const info = document.createElement('div');
+    info.className = 'wt-candidate__info';
+    const name = document.createElement('div');
+    name.className = 'wt-candidate__name';
+    name.innerHTML = `<strong>${escapeHtml(c.name)}</strong> <span class="wt-candidate__kind">${escapeHtml(c.kind)}</span>`;
+    if (c.already_created) {
+      name.innerHTML += ' <span class="wt-candidate__kind wt-candidate__kind--done">already added</span>';
+    }
+    info.appendChild(name);
+    const src = document.createElement('div');
+    src.className = 'wt-candidate__path';
+    src.innerHTML = `<span>source </span><code>${escapeHtml(c.path)}</code>`;
+    info.appendChild(src);
+    if (c.destination) {
+      const dst = document.createElement('div');
+      dst.className = 'wt-candidate__path';
+      dst.innerHTML = `<span>landing </span><code>${escapeHtml(c.destination)}</code>`;
+      info.appendChild(dst);
+    }
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn--primary btn--sm';
+    btn.textContent = c.already_created ? 'Added' : 'Create';
+    btn.disabled = !!c.already_created;
+    if (!c.already_created) {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        $('#wt-status').textContent = `Creating ${c.name}…`;
+        try {
+          const r = await api(`/api/tasks/${encodeURIComponent(STATE.slug)}/worktree`, {
+            method: 'POST',
+            body: JSON.stringify({ source_repo: c.path }),
+          });
+          if (!r.ok) throw new Error(r.error || 'create failed');
+          $('#wt-status').textContent = `Created at ${r.worktree_path}`;
+          // Refresh both the Claude info card and the modal candidate list
+          // so the user can keep adding more.
+          await selectTask(STATE.slug);
+          const fresh = await api(`/api/tasks/${encodeURIComponent(STATE.slug)}/worktree-candidates`);
+          renderWorktreeCandidates(fresh.candidates || [], fresh.projectRoot || projectRoot);
+        } catch (err) {
+          $('#wt-status').textContent = err.message || 'create failed';
+          btn.disabled = false;
+        }
+      });
+    }
+    row.appendChild(info);
+    row.appendChild(btn);
+    host.appendChild(row);
+  }
+}
+
+function renderWorktreeStatusBadge(st) {
+  const span = document.createElement('span');
+  span.className = 'wt-status';
+  const parts = [];
+  if (st.error) {
+    span.classList.add('wt-status--error');
+    span.textContent = `error: ${st.error}`;
+    return span;
+  }
+  if (st.clean) {
+    span.classList.add('wt-status--clean');
+    parts.push('● clean');
+  } else {
+    span.classList.add('wt-status--dirty');
+    const breakdown = [];
+    if (st.staged) breakdown.push(`${st.staged} staged`);
+    if (st.unstaged) breakdown.push(`${st.unstaged} modified`);
+    if (st.untracked) breakdown.push(`${st.untracked} untracked`);
+    parts.push(breakdown.join(', ') || `${st.dirty_count} changes`);
+  }
+  if (st.has_remote) {
+    if (st.ahead) parts.push(`↑${st.ahead}`);
+    if (st.behind) parts.push(`↓${st.behind}`);
+    if (!st.ahead && !st.behind) parts.push('in sync');
+  } else {
+    parts.push('no remote');
+    span.classList.add('wt-status--noremote');
+  }
+  span.textContent = parts.join(' · ');
+  return span;
+}
+
+async function pushWorktree(path, btn) {
+  if (!STATE.slug || !path) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Pushing…';
+  try {
+    const r = await api(
+      `/api/tasks/${encodeURIComponent(STATE.slug)}/worktree/push`,
+      { method: 'POST', body: JSON.stringify({ path }) },
+    );
+    if (!r.ok) throw new Error(r.error || r.message || 'push failed');
+    btn.textContent = 'Pushed';
+    setTimeout(() => {
+      btn.textContent = original;
+      btn.disabled = false;
+    }, 1500);
+    // Refresh the info card so the ahead/behind badge updates.
+    await refreshTaskTemplates();
+  } catch (err) {
+    btn.textContent = original;
+    btn.disabled = false;
+    alert(err.message || 'push failed');
+  }
+}
+
+async function pushAllWorktrees() {
+  if (!STATE.slug) return;
+  const btn = document.getElementById('btn-worktree-push-all');
+  if (!btn) return;
+  if (!confirm('Push all worktree branches to origin?')) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Pushing all…';
+  try {
+    const r = await api(
+      `/api/tasks/${encodeURIComponent(STATE.slug)}/worktrees/push-all`,
+      { method: 'POST', body: '{}' },
+    );
+    const lines = (r.results || []).map((row) => {
+      const tag = row.ok ? 'ok' : 'failed';
+      return `${tag}: ${row.path} → ${row.branch || '(no branch)'}\n  ${row.message || row.error || ''}`;
+    });
+    alert(`Pushed ${r.results.filter((x) => x.ok).length}/${r.count}\n\n${lines.join('\n\n')}`);
+    await refreshTaskTemplates();
+  } catch (err) {
+    alert(err.message || 'push-all failed');
+  } finally {
+    btn.textContent = original;
+    btn.disabled = false;
+  }
+}
+
+async function removeWorktree(path) {
+  if (!STATE.slug || !path) return;
+  if (!confirm(`Remove worktree?\n\n${path}\n\nRuns "git worktree remove" and deletes the directory.`)) return;
+  try {
+    await api(
+      `/api/tasks/${encodeURIComponent(STATE.slug)}/worktree?path=${encodeURIComponent(path)}`,
+      { method: 'DELETE' },
+    );
+    await selectTask(STATE.slug);
+  } catch (err) {
+    alert(err.message || 'remove failed');
+  }
+}
+
+function closeWorktreeModal() {
+  const m = $('#worktree-modal');
+  if (m) m.hidden = true;
+}
+
+document.getElementById('btn-create-worktree').addEventListener('click', openWorktreeModal);
+document.getElementById('btn-wt-close').addEventListener('click', closeWorktreeModal);
+document.getElementById('btn-wt-cancel').addEventListener('click', closeWorktreeModal);
+$('#worktree-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'worktree-modal') closeWorktreeModal();
+});
+
+async function refreshClaudeSessions() {
+  if (!STATE.slug) return;
+  try {
+    const d = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/claude-sessions');
+    const metaResp = await api('/api/tasks/' + encodeURIComponent(STATE.slug));
+    renderClaudeInfo(metaResp.meta, d);
+  } catch (err) {
+    console.debug('refreshClaudeSessions failed', err);
+  }
+}
+
+async function resumeClaudeSession(sessionId) {
+  if (!STATE.slug || !sessionId) return;
+  if (!confirm(`Resume Claude session ${sessionId} in a fresh tmux pane?`)) return;
+  try {
+    const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/claude/resume', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    if (!r.ok) throw new Error(r.error || 'resume failed');
+    $('#inp-interview-target').value = r.target || '';
+    $('#interview-out').textContent = `Resuming Claude session ${sessionId}\nNew tmux target: ${r.target || '(pending)'}`;
+    await refreshInterviewPreview();
+    await refreshClaudeSessions();
+  } catch (err) {
+    alert(err.message || 'resume failed');
+  }
+}
+
+document.getElementById('btn-interview-start').addEventListener('click', startInterviewPane);
 
 document.getElementById('btn-interview-stop').addEventListener('click', async () => {
   if (!STATE.slug) return;
@@ -1373,101 +1622,14 @@ document.getElementById('btn-interview-stop').addEventListener('click', async ()
   });
   $('#inp-interview-target').value = '';
   $('#interview-target-label').textContent = 'Not started';
-  $('#interview-out').textContent = `Stopped ${r.tmux_session}\n${r.tmux_message}`;
+  $('#interview-out').textContent = `Stopped ${r.tmux_session || ''}\n${r.tmux_message || ''}`;
 });
 
-document.getElementById('btn-interview-send').addEventListener('click', async () => {
-  if (!STATE.slug) return;
-  await sendPaneText('interview', true);
-});
-
-document.querySelectorAll('[data-send-text]').forEach((btn) => {
-  btn.addEventListener('click', async () => {
-    await sendPaneText(btn.dataset.sendText, false);
-  });
-});
-
-document.querySelectorAll('[data-send-text-enter]').forEach((btn) => {
-  btn.addEventListener('click', async () => {
-    await sendPaneText(btn.dataset.sendTextEnter, true);
-  });
-});
+document.getElementById('btn-interview-send').addEventListener('click', () => sendPaneText(true));
 
 document.querySelectorAll('.pane-actions [data-key]').forEach((btn) => {
-  btn.addEventListener('click', async () => {
-    const pane = btn.closest('.pane-actions')?.dataset.pane;
-    if (!pane) return;
-    await sendPaneKey(pane, btn.dataset.key);
-  });
+  btn.addEventListener('click', () => sendPaneKey(btn.dataset.key));
 });
-
-document.getElementById('btn-worktrees').addEventListener('click', async () => {
-  try {
-    await openWorktreeSelectionIfNeeded();
-  } catch (e) {
-    $('#worktree-status').textContent = e.message;
-  }
-});
-
-document.getElementById('btn-worker-start').addEventListener('click', async () => {
-  if (!STATE.slug) return;
-  const body = {
-    repo: WORKER_REPO,
-    mode: $('#worker-mode').value,
-    model: $('#worker-model').value,
-    max_iters: Number($('#worker-iters').value || 200),
-  };
-  const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/worker/start', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  });
-  alert(r.ok ? 'Started: ' + r.log_path : r.error);
-  if (r.ok && body.mode === 'tmux') {
-    await selectTask(STATE.slug);
-    showPanel('panes');
-  }
-  await refreshLog();
-});
-
-document.getElementById('btn-worker-stop').addEventListener('click', async () => {
-  if (!STATE.slug) return;
-  if (!confirm('Stop this task? This will stop the claudeloop process and kill the associated tmux session.')) return;
-  const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/worker/stop', {
-    method: 'POST',
-    body: JSON.stringify({ repo: WORKER_REPO }),
-  });
-  alert(`Stopped: ${r.tmux_session}\nprocess: ${r.process_message}\ntmux: ${r.tmux_message}`);
-  $('#inp-runner-target').value = '';
-  $('#inp-eval-target').value = '';
-  $('#runner-target-label').textContent = 'Not started';
-  $('#eval-target-label').textContent = 'Not started';
-  await refreshLog();
-  await refreshPanePreview();
-});
-
-function formatPublishResults(r) {
-  const rows = Array.isArray(r.results) ? r.results : [r];
-  return rows.map((row) => {
-    const repo = row.repo || '(repo)';
-    if (row.ok) {
-      return `ok: ${repo} -> ${row.branch || '(branch)'}${row.committed ? ' (committed)' : ' (no changes)'}`;
-    }
-    return `failed: ${repo}${row.branch ? ' -> ' + row.branch : ''}\n${row.error || 'unknown error'}`;
-  }).join('\n\n');
-}
-
-document.getElementById('btn-worker-push').addEventListener('click', async () => {
-  if (!STATE.slug) return;
-  if (!confirm('Commit/push all git worktrees under this task work/ directory to their claudeloop task branches?')) return;
-  const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/worker/push', {
-    method: 'POST',
-    body: '{}',
-  });
-  alert(`Publish ${r.ok ? 'completed' : 'failed'} (${r.count || (r.results || []).length || 1} repos)\n\n${formatPublishResults(r)}`);
-  await refreshLog();
-});
-
-document.getElementById('btn-worker-refresh').addEventListener('click', refreshLog);
 
 document.getElementById('btn-delete-task').addEventListener('click', deleteSelectedTask);
 

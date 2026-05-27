@@ -1,4 +1,20 @@
-"""`.RUD` task layout: storage, paths, worktrees, default skills."""
+"""`.RUD` task storage and helpers.
+
+Layout per project root::
+
+    <project>/.RUD/
+        NOTES.md            # project-scoped scratchpad (one file per project)
+        task-order.json
+        <slug>/
+            task.json       # task metadata
+            PLAN.md         # editable plan (deep-interview writes this)
+            INTERVIEW.md    # transcript-style log of the Claude pane
+            work/<repo>/    # auto-created git worktree (branch zhongzhu/<slug>)
+
+There is no worker / evaluator / runner anymore - the user drives Claude
+themselves via the tmux pane.  We do track which Claude session UUIDs each
+task has spawned so we can resume a session after tmux dies.
+"""
 
 from __future__ import annotations
 
@@ -16,20 +32,18 @@ from claudeloop.paths import bundled_skills_path
 
 RUD_DIR = ".RUD"
 WORK_SUBDIR = "work"
-RUNS_SUBDIR = "runs"
-WORK_ROOT_REPO_KEY = "work-root"
 
-TASK_PROMPT = "TASK_PROMPT.md"
-SUCCESS_CONDITION = "SUCCESS_CONDITION.md"
 PLAN = "PLAN.md"
+NOTES = "NOTES.md"
 INTERVIEW = "INTERVIEW.md"
 LEGACY_INTERVIEW = "interview.md"
 META = "task.json"
 TASK_ORDER = "task-order.json"
 
-ALLOWED_TEMPLATE_NAMES = frozenset({TASK_PROMPT, SUCCESS_CONDITION, PLAN})
+# Only PLAN.md is editable through the per-task template API now.  NOTES.md
+# lives at the project root and has its own dedicated endpoint.
+ALLOWED_TEMPLATE_NAMES = frozenset({PLAN})
 
-_REPO_SEG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 _TASK_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 _DUBIOUS_OWNERSHIP_RE = re.compile(r"detected dubious ownership in repository at '([^']+)'")
 
@@ -39,8 +53,144 @@ def rud_root(project_root: Path) -> Path:
 
 
 def task_root(project_root: Path, slug: str) -> Path:
-    """``<project>/.RUD/<slug>/`` — task name becomes slug (e.g. xorl1)."""
+    """``<project>/.RUD/<slug>/`` - task name becomes slug (e.g. xorl1)."""
     return (rud_root(project_root) / slug).resolve()
+
+
+def list_task_worktrees(project_root: Path, slug: str) -> list[Path]:
+    """Return every git work-tree directory under ``<task>/work/`` sorted by name.
+
+    A child counts only if it looks like a git work tree (``.git`` exists
+    as a file or directory, OR ``git rev-parse`` agrees), so leftover
+    non-git folders won't confuse the UI.
+    """
+    work = task_root(project_root, slug) / WORK_SUBDIR
+    if not work.is_dir():
+        return []
+    out: list[Path] = []
+    try:
+        children = sorted(work.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    for child in children:
+        try:
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+        except OSError:
+            continue
+        dotgit = child / ".git"
+        if dotgit.exists() or git_toplevel(child) is not None:
+            out.append(child.resolve())
+    return out
+
+
+def task_worktree_path(project_root: Path, slug: str) -> Path | None:
+    """Primary worktree (= first entry in ``list_task_worktrees``)."""
+    wts = list_task_worktrees(project_root, slug)
+    return wts[0] if wts else None
+
+
+def _detect_branch_in(wt: Path) -> str:
+    """Best-effort current branch for a worktree directory."""
+    if not wt.is_dir():
+        return ""
+    ok, out, _ = _git(["branch", "--show-current"], wt, timeout=10)
+    return out.strip() if ok else ""
+
+
+def detect_and_persist_worktree(project_root: Path, slug: str) -> TaskMeta | None:
+    """Sync ``meta.worktrees`` / ``meta.branches`` with what's on disk.
+
+    Behaviour:
+    - drops entries whose directory no longer exists;
+    - keeps the existing list order so the *primary* (claude-pane cwd)
+      doesn't shuffle around unexpectedly;
+    - appends any newly discovered worktree directories in alphabetical
+      order (this is what back-fills tasks created before the
+      auto-worktree feature, or tasks where the user did
+      ``git worktree add`` manually);
+    - recomputes per-worktree branch names with ``git branch --show-current``
+      when missing.
+    """
+    meta = read_meta(project_root, slug)
+    if meta is None:
+        return None
+
+    on_disk = list_task_worktrees(project_root, slug)
+    on_disk_paths = {str(p) for p in on_disk}
+
+    ordered: list[str] = []
+    branches: list[str] = []
+    # Preserve meta's existing ordering, dropping disappearing paths.
+    for i, p in enumerate(meta.worktrees):
+        if p in on_disk_paths and p not in ordered:
+            ordered.append(p)
+            branches.append(meta.branches[i] if i < len(meta.branches) else "")
+    # Append disk-only newcomers in alphabetical order.
+    for p_obj in on_disk:
+        s = str(p_obj)
+        if s not in ordered:
+            ordered.append(s)
+            branches.append("")
+    # Fill in missing branch labels with a fresh `git branch --show-current`.
+    for i, p in enumerate(ordered):
+        if not branches[i]:
+            try:
+                branches[i] = _detect_branch_in(Path(p))
+            except OSError:
+                branches[i] = ""
+
+    primary_wt = ordered[0] if ordered else ""
+    primary_br = branches[0] if branches else ""
+    if (
+        ordered == meta.worktrees
+        and branches == meta.branches
+        and primary_wt == meta.worktree_path
+        and primary_br == meta.branch
+    ):
+        return meta
+    return update_meta(
+        project_root,
+        slug,
+        worktree_path=primary_wt,
+        branch=primary_br,
+        worktrees=ordered,
+        branches=branches,
+    ) or meta
+
+
+def remove_task_worktree(project_root: Path, slug: str, worktree: Path) -> tuple[bool, str]:
+    """Delete a single worktree from disk + git registry, then resync meta.
+
+    Tries the clean ``git worktree remove`` path first, falls back to
+    ``--force`` if Git complains (typical when the worktree has
+    uncommitted changes or has been moved).  Returns ``(ok, message)``.
+    """
+    try:
+        worktree = worktree.expanduser().resolve()
+    except OSError as exc:
+        return False, f"invalid path: {exc}"
+    meta = read_meta(project_root, slug)
+    if meta is None:
+        return False, "task not found"
+    if str(worktree) not in meta.worktrees:
+        return False, "worktree is not registered with this task"
+    # Run git from the worktree itself so it can locate its parent repo.
+    if worktree.is_dir():
+        ok, _out, err = _git(["worktree", "remove", str(worktree)], worktree)
+        if not ok:
+            ok, _out, err = _git(
+                ["worktree", "remove", "--force", str(worktree)],
+                worktree,
+            )
+        if not ok:
+            # Worktree gone but registration lingers? Try a hard delete.
+            try:
+                shutil.rmtree(worktree)
+            except OSError:
+                return False, err or "git worktree remove failed"
+    detect_and_persist_worktree(project_root, slug)
+    return True, "worktree removed"
 
 
 def slugify(title: str) -> str:
@@ -74,18 +224,17 @@ def package_templates_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "templates"
 
 
-def copy_default_templates(dest_dir: Path, overwrite: bool = False) -> None:
-    src = package_templates_dir()
+def copy_default_plan(dest_dir: Path, overwrite: bool = False) -> None:
+    """Seed PLAN.md from the shipped template if missing."""
+    src = package_templates_dir() / PLAN
+    out = dest_dir / PLAN
+    if out.exists() and not overwrite:
+        return
     dest_dir.mkdir(parents=True, exist_ok=True)
-    for name in (TASK_PROMPT, SUCCESS_CONDITION, PLAN):
-        out = dest_dir / name
-        if out.exists() and not overwrite:
-            continue
-        p = src / name
-        if p.is_file():
-            out.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
-        else:
-            out.write_text("", encoding="utf-8")
+    if src.is_file():
+        out.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        out.write_text("", encoding="utf-8")
 
 
 @dataclass
@@ -95,14 +244,21 @@ class TaskMeta:
     general_goal: str
     created_at: str
     updated_at: str
-    work_dirs: list[str] = field(default_factory=list)
     skills_path: str = ""
     interview_model: str = "claude-sonnet-4-6"
-    interview_backend: str = "cli"
     tmux_interview_target: str = ""
-    tmux_ask_target: str = ""
-    tmux_runner_target: str = ""
-    tmux_evaluator_target: str = ""
+    # ``worktree_path`` and ``branch`` are the *primary* worktree (also
+    # mirrored at ``worktrees[0]`` / ``branches[0]``); the Claude pane
+    # always opens there.  Use the lists when iterating over all the
+    # worktrees a task owns.
+    worktree_path: str = ""
+    branch: str = ""
+    worktrees: list[str] = field(default_factory=list)
+    branches: list[str] = field(default_factory=list)
+    # UUIDs of every Claude Code session this task has launched (most
+    # recent last).  We use these to offer a "Resume" button when tmux is
+    # killed.
+    claude_session_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,35 +267,69 @@ class TaskMeta:
             "general_goal": self.general_goal,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "work_dirs": self.work_dirs,
             "skills_path": self.skills_path,
             "interview_model": self.interview_model,
-            "interview_backend": self.interview_backend,
             "tmux_interview_target": self.tmux_interview_target,
-            "tmux_ask_target": self.tmux_ask_target,
-            "tmux_runner_target": self.tmux_runner_target,
-            "tmux_evaluator_target": self.tmux_evaluator_target,
+            "worktree_path": self.worktree_path,
+            "branch": self.branch,
+            "worktrees": list(self.worktrees),
+            "branches": list(self.branches),
+            "claude_session_ids": list(self.claude_session_ids),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TaskMeta:
-        ib = str(data.get("interview_backend", "cli")).lower()
-        if ib not in ("cli", "sdk"):
-            ib = "cli"
+        # Tolerate legacy fields (work_dirs, tmux_runner_target, ...) by
+        # only reading what we still care about.
+        raw_sessions = data.get("claude_session_ids") or []
+        sessions: list[str] = []
+        if isinstance(raw_sessions, list):
+            seen: set[str] = set()
+            for s in raw_sessions:
+                sid = str(s).strip()
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    sessions.append(sid)
+        raw_wts = data.get("worktrees")
+        wts: list[str] = []
+        if isinstance(raw_wts, list):
+            for p in raw_wts:
+                s = str(p).strip()
+                if s and s not in wts:
+                    wts.append(s)
+        raw_brs = data.get("branches")
+        brs: list[str] = []
+        if isinstance(raw_brs, list):
+            brs = [str(b) for b in raw_brs]
+        # Pre-list-era task.json: lift the single worktree_path / branch
+        # into the new list so the rest of the code can treat everything
+        # uniformly.
+        legacy_wt = str(data.get("worktree_path", "")).strip()
+        legacy_br = str(data.get("branch", "")).strip()
+        if not wts and legacy_wt:
+            wts = [legacy_wt]
+            brs = [legacy_br]
+        # Make sure branches has the same length as worktrees (pad / trim).
+        if len(brs) < len(wts):
+            brs = brs + [""] * (len(wts) - len(brs))
+        elif len(brs) > len(wts):
+            brs = brs[: len(wts)]
+        primary_wt = wts[0] if wts else legacy_wt
+        primary_br = brs[0] if brs else legacy_br
         return cls(
             slug=str(data["slug"]),
             title=str(data.get("title", "")),
             general_goal=str(data.get("general_goal", "")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
-            work_dirs=[str(x) for x in data.get("work_dirs", [])],
             skills_path=str(data.get("skills_path", "")),
             interview_model=str(data.get("interview_model", "claude-sonnet-4-6")),
-            interview_backend=ib,
             tmux_interview_target=str(data.get("tmux_interview_target", "")),
-            tmux_ask_target=str(data.get("tmux_ask_target", "")),
-            tmux_runner_target=str(data.get("tmux_runner_target", "")),
-            tmux_evaluator_target=str(data.get("tmux_evaluator_target", "")),
+            worktree_path=primary_wt,
+            branch=primary_br,
+            worktrees=wts,
+            branches=brs,
+            claude_session_ids=sessions,
         )
 
 
@@ -185,9 +375,7 @@ def _remove_task_from_order(project_root: Path, slug: str) -> None:
         return
     try:
         _task_order_path(project_root).unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
+    except (FileNotFoundError, OSError):
         pass
 
 
@@ -215,19 +403,15 @@ def create_task(
     general_goal: str,
     skills_path: Path | None = None,
     interview_model: str = "claude-sonnet-4-6",
-    interview_backend: str = "cli",
-    work_dirs: list[Path] | None = None,
     *,
-    auto_worktrees: bool = True,
+    auto_worktree: bool = True,
 ) -> TaskMeta:
     project_root = project_root.resolve()
     base = slugify(title)
     slug = ensure_unique_slug(project_root, base)
     root = task_root(project_root, slug)
     root.mkdir(parents=True, exist_ok=True)
-    (root / WORK_SUBDIR).mkdir(exist_ok=True)
-    (root / RUNS_SUBDIR).mkdir(exist_ok=True)
-    copy_default_templates(root, overwrite=False)
+    copy_default_plan(root, overwrite=False)
     if not (root / INTERVIEW).exists():
         legacy = root / LEGACY_INTERVIEW
         if legacy.is_file():
@@ -237,12 +421,6 @@ def create_task(
     sk = (skills_path or bundled_skills_path()).expanduser().resolve()
     if not sk.is_file():
         sk = bundled_skills_path().resolve()
-    sp = str(sk)
-    wd: list[str] = []
-    if work_dirs:
-        for p in work_dirs:
-            wd.append(str(p.expanduser().resolve()))
-    ib = interview_backend.lower() if interview_backend.lower() in ("cli", "sdk") else "cli"
     now = _now_iso()
     meta = TaskMeta(
         slug=slug,
@@ -250,50 +428,115 @@ def create_task(
         general_goal=general_goal.strip(),
         created_at=now,
         updated_at=now,
-        work_dirs=wd,
-        skills_path=sp,
+        skills_path=str(sk),
         interview_model=interview_model,
-        interview_backend=ib,
     )
     write_meta(project_root, meta)
     _insert_task_order_front(project_root, meta.slug)
-    if auto_worktrees and wd:
-        prepare_all_worktrees(project_root, slug)
-    return meta
+    if auto_worktree:
+        worktree, _branch, msg = prepare_task_worktree(project_root, slug)
+        if worktree is None:
+            # The web layer logs this; keep one print here too so anyone
+            # running create_task() from a script sees why nothing landed
+            # under <task>/work/.
+            print(
+                f"[claudeloop] auto-worktree skipped for {slug!r}: {msg}",
+                flush=True,
+            )
+        # Either way, sync meta with whatever is now on disk - this also
+        # handles the case where prepare_task_worktree said "worktree
+        # already exists" because of a previous attempt.
+        detect_and_persist_worktree(project_root, slug)
+    return read_meta(project_root, slug) or meta
 
 
 def update_meta(
     project_root: Path,
     slug: str,
     *,
-    work_dirs: list[str] | None = None,
     skills_path: str | None = None,
     interview_model: str | None = None,
-    interview_backend: str | None = None,
     tmux_interview_target: str | None = None,
-    tmux_ask_target: str | None = None,
-    tmux_runner_target: str | None = None,
-    tmux_evaluator_target: str | None = None,
+    worktree_path: str | None = None,
+    branch: str | None = None,
+    worktrees: list[str] | None = None,
+    branches: list[str] | None = None,
 ) -> TaskMeta | None:
     meta = read_meta(project_root, slug)
     if not meta:
         return None
-    if work_dirs is not None:
-        meta.work_dirs = work_dirs
     if skills_path is not None:
         meta.skills_path = skills_path
     if interview_model is not None:
         meta.interview_model = interview_model
-    if interview_backend is not None and interview_backend.lower() in ("cli", "sdk"):
-        meta.interview_backend = interview_backend.lower()
     if tmux_interview_target is not None:
         meta.tmux_interview_target = tmux_interview_target
-    if tmux_ask_target is not None:
-        meta.tmux_ask_target = tmux_ask_target
-    if tmux_runner_target is not None:
-        meta.tmux_runner_target = tmux_runner_target
-    if tmux_evaluator_target is not None:
-        meta.tmux_evaluator_target = tmux_evaluator_target
+    if worktree_path is not None:
+        meta.worktree_path = worktree_path
+    if branch is not None:
+        meta.branch = branch
+    if worktrees is not None:
+        meta.worktrees = list(worktrees)
+    if branches is not None:
+        meta.branches = list(branches)
+    # Keep primary in sync with list[0] (if list is set), and trim branches
+    # length to match worktrees length.
+    if worktrees is not None and meta.worktrees:
+        meta.worktree_path = meta.worktrees[0]
+    if branches is not None and meta.branches:
+        meta.branch = meta.branches[0]
+    if len(meta.branches) < len(meta.worktrees):
+        meta.branches = meta.branches + [""] * (len(meta.worktrees) - len(meta.branches))
+    elif len(meta.branches) > len(meta.worktrees):
+        meta.branches = meta.branches[: len(meta.worktrees)]
+    if not meta.worktrees:
+        meta.worktree_path = ""
+        meta.branch = ""
+    meta.updated_at = _now_iso()
+    write_meta(project_root, meta)
+    return meta
+
+
+def rename_task_meta(
+    project_root: Path,
+    slug: str,
+    *,
+    title: str | None = None,
+    general_goal: str | None = None,
+) -> TaskMeta | None:
+    """Update human-readable task metadata (title and/or goal).
+
+    Note: slug never changes - it would imply moving the directory and
+    invalidating session IDs / tmux session names. If you really want a
+    new slug, delete the task and recreate it.
+    """
+    meta = read_meta(project_root, slug)
+    if not meta:
+        return None
+    if title is not None:
+        cleaned = title.strip()
+        if cleaned:
+            meta.title = cleaned
+    if general_goal is not None:
+        meta.general_goal = general_goal.strip()
+    meta.updated_at = _now_iso()
+    write_meta(project_root, meta)
+    return meta
+
+
+def add_claude_session(project_root: Path, slug: str, session_id: str) -> TaskMeta | None:
+    """Append *session_id* to the task's history (dedup, keep order)."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return None
+    meta = read_meta(project_root, slug)
+    if not meta:
+        return None
+    if sid in meta.claude_session_ids:
+        # Move to the end so "latest" stays last.
+        meta.claude_session_ids = [s for s in meta.claude_session_ids if s != sid] + [sid]
+    else:
+        meta.claude_session_ids.append(sid)
     meta.updated_at = _now_iso()
     write_meta(project_root, meta)
     return meta
@@ -339,7 +582,7 @@ def reorder_tasks(project_root: Path, slugs: list[str]) -> tuple[bool, str]:
 
 
 def delete_task(project_root: Path, slug: str) -> tuple[bool, str]:
-    """Delete ``<project>/.RUD/<slug>`` after verifying the target stays under ``.RUD``."""
+    """Delete ``<project>/.RUD/<slug>`` after verifying it stays under ``.RUD``."""
     if not _TASK_SLUG_RE.match(slug):
         return False, "invalid slug"
     root = rud_root(project_root)
@@ -350,6 +593,12 @@ def delete_task(project_root: Path, slug: str) -> tuple[bool, str]:
         return False, "invalid task path"
     if not td.is_dir() or not (td / META).is_file():
         return False, "task not found"
+    # Best-effort remove the git worktree registration before deleting on disk
+    # so the user's main checkout doesn't keep a dangling `worktree list`
+    # entry pointing at a missing path.
+    wt = task_worktree_path(project_root, slug)
+    if wt is not None:
+        _git_worktree_remove(project_root.resolve(), wt)
     try:
         shutil.rmtree(td)
     except OSError as exc:
@@ -368,6 +617,9 @@ def path_under_task(task_dir: Path, relative: str) -> Path | None:
     except ValueError:
         return None
     return candidate
+
+
+# --- Templates (per-task) ---------------------------------------------------
 
 
 def read_template(project_root: Path, slug: str, name: str) -> str | None:
@@ -392,6 +644,37 @@ def write_template(project_root: Path, slug: str, name: str, content: str) -> bo
     except PermissionError:
         return _sudo_write_text(path, content)
     return True
+
+
+# --- Notes (per-project) ----------------------------------------------------
+
+
+def project_notes_path(project_root: Path) -> Path:
+    return rud_root(project_root) / NOTES
+
+
+def read_project_notes(project_root: Path) -> str:
+    p = project_notes_path(project_root)
+    if not p.is_file():
+        return ""
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def write_project_notes(project_root: Path, content: str) -> bool:
+    root = rud_root(project_root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    p = project_notes_path(project_root)
+    try:
+        p.write_text(content, encoding="utf-8")
+    except PermissionError:
+        return _sudo_write_text(p, content)
+    return True
+
+
+# --- Privileged fallbacks ---------------------------------------------------
 
 
 def _sudo_write_text(path: Path, content: str) -> bool:
@@ -427,7 +710,6 @@ def _sudo_write_text(path: Path, content: str) -> bool:
 
 
 def _sudo_rmtree(path: Path, allowed_root: Path) -> bool:
-    """Remove a task directory with sudo after re-checking the safety boundary."""
     try:
         target = path.resolve()
         root = allowed_root.resolve()
@@ -446,6 +728,9 @@ def _sudo_rmtree(path: Path, allowed_root: Path) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
+
+
+# --- Interview transcript ---------------------------------------------------
 
 
 def append_interview(project_root: Path, slug: str, role: str, text: str) -> None:
@@ -472,24 +757,59 @@ def read_interview(project_root: Path, slug: str) -> str:
     return p.read_text(encoding="utf-8", errors="replace")
 
 
-# --- git / worktree ---
+# --- Claude session lookup (~/.claude/projects/<encoded>/<uuid>.jsonl) ------
 
 
-def _git(args: list[str], cwd: Path) -> tuple[bool, str, str]:
+def claude_project_dir(cwd: Path) -> Path:
+    """Encode *cwd* the way Claude Code's CLI does for ``~/.claude/projects``.
+
+    Both ``/`` and ``.`` become ``-`` in the encoded directory name, so e.g.
+    ``/home/u/proj/.RUD/foo/work/r`` becomes
+    ``-home-u-proj--RUD-foo-work-r`` (the double dash represents ``/.``).
+    """
+    s = str(cwd.resolve())
+    encoded = re.sub(r"[/.]", "-", s)
+    return (Path.home() / ".claude" / "projects" / encoded).resolve()
+
+
+def list_session_files(cwd: Path) -> list[Path]:
+    """All ``<uuid>.jsonl`` session files for *cwd*, oldest first."""
+    d = claude_project_dir(cwd)
+    if not d.is_dir():
+        return []
+    files = [p for p in d.iterdir() if p.is_file() and p.suffix == ".jsonl"]
+    files.sort(key=lambda p: p.stat().st_mtime)
+    return files
+
+
+def session_id_from_path(path: Path) -> str:
+    return path.stem  # filename without .jsonl
+
+
+# --- Git / worktree helpers -------------------------------------------------
+
+
+def _git(args: list[str], cwd: Path, timeout: int = 60) -> tuple[bool, str, str]:
     def run() -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", *args],
             cwd=str(cwd),
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=timeout,
         )
 
-    r = run()
+    try:
+        r = run()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, "", str(exc)
     if r.returncode != 0:
-        safe_dir = _dubious_ownership_safe_dir(cwd, r.stdout, r.stderr)
-        if safe_dir is not None and _mark_git_safe_directory(safe_dir):
-            r = run()
+        safe = _dubious_ownership_safe_dir(cwd, r.stdout, r.stderr)
+        if safe is not None and _mark_git_safe_directory(safe):
+            try:
+                r = run()
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return False, "", str(exc)
     return r.returncode == 0, (r.stdout or "").strip(), (r.stderr or "").strip()
 
 
@@ -535,234 +855,282 @@ def git_toplevel(path: Path) -> Path | None:
     return Path(out)
 
 
-def repo_name_for_work_dir(work_dir: Path) -> str:
-    return work_dir.resolve().name
+def _branch_name_for(slug: str) -> str:
+    # Per AK_skills.md the user wants branches under zhongzhu/<slug>.
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", slug).strip("-") or "task"
+    return f"zhongzhu/{cleaned[:80]}"
 
 
-def parse_repo_key(repo_key: str) -> list[str] | None:
-    """Return path segments for ``G1`` or ``G1/G2``; None if invalid."""
-    if repo_key == WORK_ROOT_REPO_KEY:
-        return [WORK_ROOT_REPO_KEY]
-    if not repo_key or repo_key.startswith("/") or ".." in repo_key:
-        return None
-    parts = [p for p in repo_key.replace("\\", "/").split("/") if p]
-    if not parts or len(parts) > 2:
-        return None
-    for p in parts:
-        if not _REPO_SEG_RE.match(p):
-            return None
-    return parts
-
-
-def work_path_for_repo_key(task_dir: Path, repo_key: str) -> Path | None:
-    if repo_key == WORK_ROOT_REPO_KEY:
-        return task_dir.resolve() / WORK_SUBDIR
-    parts = parse_repo_key(repo_key)
-    if not parts:
-        return None
-    d = task_dir.resolve() / WORK_SUBDIR
-    for part in parts:
-        d = d / part
-    return d
-
-
-def runs_dir_for_repo(task_dir: Path, repo_key: str) -> Path | None:
-    if repo_key == WORK_ROOT_REPO_KEY:
-        d = task_dir.resolve() / RUNS_SUBDIR / WORK_ROOT_REPO_KEY
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-    parts = parse_repo_key(repo_key)
-    if not parts:
-        return None
-    d = task_dir.resolve() / RUNS_SUBDIR
-    for part in parts:
-        d = d / part
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def direct_child_git_repos(parent_git_root: Path) -> list[Path]:
-    """Immediate subdirectories of *parent_git_root* that are separate git roots (max one level)."""
-    parent_git_root = parent_git_root.resolve()
-    out: list[Path] = []
+def direct_child_git_repos(parent: Path) -> list[Path]:
+    """Immediate subdirectories of *parent* that are themselves git repo roots."""
     try:
-        for child in sorted(parent_git_root.iterdir()):
+        parent = parent.resolve()
+    except OSError:
+        return []
+    out: list[Path] = []
+    if not parent.is_dir():
+        return out
+    try:
+        children = sorted(parent.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return out
+    for child in children:
+        try:
             if not child.is_dir() or child.name.startswith("."):
                 continue
-            top = git_toplevel(child)
-            if top and top.resolve() == child.resolve():
-                out.append(child)
-    except OSError:
-        pass
+        except OSError:
+            continue
+        top = git_toplevel(child)
+        if top is not None and top.resolve() == child.resolve():
+            out.append(child)
     return out
 
 
-def _branch_slug(label: str) -> str:
-    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", label).strip("-")
-    return (s[:80] or "wt").replace("/", "-")
+def list_worktree_candidates(project_root: Path) -> list[dict[str, Any]]:
+    """Git repos a task can branch a worktree from.
+
+    - If *project_root* itself is a git repo, returns just that one with
+      ``kind == "self"``.
+    - Otherwise scans immediate subdirectories for git repos and returns
+      each with ``kind == "child"``.  Useful when the registered project
+      is a container directory holding several clones side-by-side (e.g.
+      ``~/work/xorl/{xorl-internal,xorl-eval}``).
+    """
+    try:
+        project_root = project_root.resolve()
+    except OSError:
+        return []
+    git_root = git_toplevel(project_root)
+    if git_root is not None:
+        return [{
+            "path": str(git_root),
+            "name": git_root.name,
+            "kind": "self",
+        }]
+    return [
+        {"path": str(p), "name": p.name, "kind": "child"}
+        for p in direct_child_git_repos(project_root)
+    ]
 
 
-def _git_worktree_add(
-    git_root: Path,
-    worktree_dest: Path,
-    task_slug: str,
-    branch_suffix: str,
-) -> tuple[bool, str, Path | None]:
-    """``git worktree add`` from *git_root* to *worktree_dest*."""
-    git_root = git_root.resolve()
-    worktree_dest = worktree_dest.resolve()
-    if not git_toplevel(git_root):
-        return False, f"Not a git repository: {git_root}", None
-    if worktree_dest.is_dir():
-        ok, _, _ = _git(["rev-parse", "--is-inside-work-tree"], worktree_dest)
+def prepare_task_worktree_from(
+    project_root: Path,
+    slug: str,
+    source_repo: Path,
+) -> tuple[Path | None, str, str]:
+    """Create a worktree at ``<task>/work/<source-repo-name>`` branched from
+    the HEAD of *source_repo*.
+
+    Returns ``(worktree_path_or_None, branch_name, message)``.
+    """
+    project_root = project_root.resolve()
+    try:
+        source_repo = source_repo.expanduser().resolve()
+    except OSError as exc:
+        return None, "", f"invalid source path: {exc}"
+    git_root = git_toplevel(source_repo)
+    if git_root is None:
+        return None, "", f"not a git repository: {source_repo}"
+    branch = _branch_name_for(slug)
+    td = task_root(project_root, slug)
+    work_dir = td / WORK_SUBDIR / git_root.name
+    work_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    if work_dir.is_dir():
+        ok, _, _ = _git(["rev-parse", "--is-inside-work-tree"], work_dir)
         if ok:
-            return True, "existing", worktree_dest
-    worktree_dest.parent.mkdir(parents=True, exist_ok=True)
+            return work_dir.resolve(), branch, "worktree already exists"
+
     ok_head, head_out, head_err = _git(["rev-parse", "HEAD"], git_root)
-    if not ok_head:
-        return False, f"Cannot read HEAD: {head_err}", None
-    branch = f"claudeloop-rud/{_branch_slug(task_slug)}/{_branch_slug(branch_suffix)}"
+    if not ok_head or not head_out:
+        return None, branch, f"cannot read HEAD: {head_err or '(empty)'}"
+
     add_new = _git(
-        ["worktree", "add", "-b", branch, str(worktree_dest), head_out],
+        ["worktree", "add", "-b", branch, str(work_dir), head_out],
         git_root,
     )
     if add_new[0]:
-        return True, "created", worktree_dest
-    reuse = _git(["worktree", "add", str(worktree_dest), branch], git_root)
+        return work_dir.resolve(), branch, "worktree created"
+    reuse = _git(["worktree", "add", str(work_dir), branch], git_root)
     if reuse[0]:
-        return True, "reused_branch", worktree_dest
-    return False, f"git worktree add failed: {add_new[2] or add_new[1]} | {reuse[2]}", None
+        return work_dir.resolve(), branch, "worktree attached to existing branch"
+    return None, branch, f"git worktree add failed: {add_new[2] or add_new[1]} | {reuse[2]}"
 
 
-def prepare_worktrees_from_work_dir(
-    task_dir: Path,
-    work_dir: Path,
+def prepare_task_worktree(
+    project_root: Path,
     slug: str,
-) -> list[dict[str, Any]]:
-    """
-    Primary repo ``G1`` -> ``<task>/work/G1``.
-    Nested repos (direct children of G1's git root only) -> ``<task>/work/G1/G2``, …
-    """
-    task_dir = task_dir.resolve()
-    results: list[dict[str, Any]] = []
-    git_root = git_toplevel(work_dir)
-    if not git_root:
-        child_repos = direct_child_git_repos(work_dir)
-        if not child_repos:
-            results.append(
-                {
-                    "work_dir": str(work_dir),
-                    "repo_key": None,
-                    "ok": False,
-                    "reason": f"Not a git repository and no direct child git repositories: {work_dir}",
-                    "worktree": None,
-                }
-            )
-            return results
-        for child_root in child_repos:
-            repo_key = child_root.name
-            dest = task_dir / WORK_SUBDIR / repo_key
-            ok, reason, wt = _git_worktree_add(child_root, dest, slug, repo_key)
-            results.append(
-                {
-                    "work_dir": str(child_root),
-                    "repo_key": repo_key,
-                    "ok": ok,
-                    "reason": reason,
-                    "worktree": str(wt) if wt else None,
-                }
-            )
-        return results
+) -> tuple[Path | None, str, str]:
+    """Auto-create from the project root itself (only works when it's a git repo).
 
-    primary_name = git_root.name
-    dest_primary = task_dir / WORK_SUBDIR / primary_name
-    ok, reason, wt = _git_worktree_add(git_root, dest_primary, slug, primary_name)
-    results.append(
-        {
-            "work_dir": str(work_dir),
-            "repo_key": primary_name,
-            "ok": ok,
-            "reason": reason,
-            "worktree": str(wt) if wt else None,
-        }
-    )
-    if not ok:
-        return results
-
-    for child in direct_child_git_repos(git_root):
-        nested_key = f"{primary_name}/{child.name}"
-        dest_nested = task_dir / WORK_SUBDIR / primary_name / child.name
-        child_root = git_toplevel(child)
-        if not child_root:
-            continue
-        ok2, reason2, wt2 = _git_worktree_add(child_root, dest_nested, slug, nested_key)
-        results.append(
-            {
-                "work_dir": str(child),
-                "repo_key": nested_key,
-                "ok": ok2,
-                "reason": reason2,
-                "worktree": str(wt2) if wt2 else None,
-            }
+    Returns ``(worktree_path_or_None, branch_name, message)``.  Container
+    project roots (no ``.git`` of their own) return ``(None, branch,
+    "project root is not a git repository; pick a candidate manually")``;
+    the web UI exposes a manual picker for that case.
+    """
+    project_root = project_root.resolve()
+    if git_toplevel(project_root) is None:
+        return (
+            None,
+            _branch_name_for(slug),
+            "project root is not a git repository; pick a candidate manually",
         )
-    return results
+    return prepare_task_worktree_from(project_root, slug, project_root)
 
 
-def prepare_all_worktrees(project_root: Path, slug: str) -> list[dict[str, Any]]:
+def worktree_status(wt: Path) -> dict[str, Any] | None:
+    """Return a ``git status``-derived snapshot of *wt*, or ``None`` on error.
+
+    The shape is friendly for direct JSON serialisation; see the keys at
+    the bottom of the function.  Uses ``git status --branch --porcelain``
+    so we get the branch line (with ahead/behind) plus a per-file tally.
+    """
+    try:
+        wt = wt.resolve()
+    except OSError:
+        return None
+    if not wt.is_dir():
+        return None
+    ok, out, err = _git(["status", "--branch", "--porcelain"], wt, timeout=15)
+    if not ok:
+        return {
+            "path": str(wt),
+            "branch": "",
+            "upstream": "",
+            "has_remote": False,
+            "ahead": 0,
+            "behind": 0,
+            "staged": 0,
+            "unstaged": 0,
+            "untracked": 0,
+            "clean": False,
+            "dirty_count": 0,
+            "error": err or "git status failed",
+        }
+    branch = ""
+    upstream = ""
+    ahead = 0
+    behind = 0
+    staged = 0
+    unstaged = 0
+    untracked = 0
+    for line in out.splitlines():
+        if line.startswith("## "):
+            rest = line[3:]
+            if " [" in rest and rest.endswith("]"):
+                head, brackets = rest.rsplit(" [", 1)
+                rest = head
+                for part in brackets.rstrip("]").split(","):
+                    p = part.strip()
+                    if p.startswith("ahead "):
+                        try:
+                            ahead = int(p[6:])
+                        except ValueError:
+                            pass
+                    elif p.startswith("behind "):
+                        try:
+                            behind = int(p[7:])
+                        except ValueError:
+                            pass
+            if "..." in rest:
+                bp, up = rest.split("...", 1)
+                branch = bp.strip()
+                upstream = up.strip()
+            else:
+                branch = rest.strip()
+        elif line.startswith("?? "):
+            untracked += 1
+        elif len(line) >= 2:
+            s_char, w_char = line[0], line[1]
+            if s_char not in (" ", "?"):
+                staged += 1
+            if w_char not in (" ", "?"):
+                unstaged += 1
+    dirty = staged + unstaged + untracked
+    return {
+        "path": str(wt),
+        "branch": branch,
+        "upstream": upstream,
+        "has_remote": bool(upstream),
+        "ahead": ahead,
+        "behind": behind,
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+        "clean": dirty == 0,
+        "dirty_count": dirty,
+    }
+
+
+def list_task_worktree_statuses(project_root: Path, slug: str) -> list[dict[str, Any]]:
+    """Status snapshot for every worktree currently tracked by the task."""
     meta = read_meta(project_root, slug)
-    if not meta:
+    if meta is None:
         return []
-    td = task_root(project_root, slug)
-    all_results: list[dict[str, Any]] = []
-    for wd_str in meta.work_dirs:
-        all_results.extend(prepare_worktrees_from_work_dir(td, Path(wd_str), slug))
-    return all_results
+    out: list[dict[str, Any]] = []
+    for p_str in meta.worktrees:
+        s = worktree_status(Path(p_str))
+        if s is None:
+            s = {
+                "path": p_str,
+                "branch": "",
+                "upstream": "",
+                "has_remote": False,
+                "ahead": 0,
+                "behind": 0,
+                "staged": 0,
+                "unstaged": 0,
+                "untracked": 0,
+                "clean": False,
+                "dirty_count": 0,
+                "error": "worktree directory missing",
+            }
+        out.append(s)
+    return out
 
 
-def prepare_selected_worktrees(project_root: Path, slug: str, work_dirs: list[Path]) -> list[dict[str, Any]]:
-    """Prepare worktrees only for the explicit source repo/container directories."""
-    td = task_root(project_root, slug)
-    all_results: list[dict[str, Any]] = []
-    for work_dir in work_dirs:
-        all_results.extend(prepare_worktrees_from_work_dir(td, work_dir, slug))
-    return all_results
+def push_worktree_branch(wt: Path) -> dict[str, Any]:
+    """``git push -u origin <current-branch>`` from inside the worktree.
+
+    Returns a dict with ``ok``, ``branch``, and a human-readable
+    ``message``.  Doesn't touch task metadata - the caller can re-run
+    ``worktree_status`` to refresh ahead/behind counts.
+    """
+    try:
+        wt = wt.resolve()
+    except OSError as exc:
+        return {"ok": False, "error": str(exc), "branch": "", "message": str(exc)}
+    if not wt.is_dir():
+        return {"ok": False, "error": "worktree not found", "branch": "", "message": "worktree not found"}
+    ok, branch, err = _git(["branch", "--show-current"], wt, timeout=10)
+    branch = branch.strip()
+    if not ok or not branch:
+        msg = err or "no current branch"
+        return {"ok": False, "error": msg, "branch": "", "message": msg}
+    ok_push, out, err_push = _git(
+        ["push", "-u", "origin", branch], wt, timeout=180
+    )
+    text = "\n".join(x for x in (out, err_push) if x).strip()
+    return {
+        "ok": ok_push,
+        "branch": branch,
+        "message": text or ("pushed" if ok_push else "push failed"),
+        "error": "" if ok_push else (text or "push failed"),
+    }
 
 
-def list_work_repo_keys(task_dir: Path) -> list[str]:
-    """Repo keys under ``work/``: ``G1``, ``G1/G2``, … (at most one slash)."""
-    work = task_dir.resolve() / WORK_SUBDIR
-    if not work.is_dir():
-        return []
-    keys: list[str] = []
-    for p in sorted(work.iterdir()):
-        if not p.is_dir() or p.name.startswith("."):
-            continue
-        keys.append(p.name)
-        try:
-            for q in sorted(p.iterdir()):
-                if not q.is_dir() or q.name.startswith("."):
-                    continue
-                top = git_toplevel(q)
-                if top and top.resolve() == q.resolve():
-                    keys.append(f"{p.name}/{q.name}")
-        except OSError:
-            pass
-    keys.sort()
-    return keys
-
-
-def validate_repo_key(repo_key: str) -> bool:
-    return parse_repo_key(repo_key) is not None
-
-
-# Backwards-compatible name for tests
-def prepare_worktree(
-    task_dir: Path,
-    work_dir: Path,
-    slug: str,
-) -> tuple[bool, str, Path | None]:
-    rows = prepare_worktrees_from_work_dir(task_dir, work_dir, slug)
-    if not rows:
-        return False, "no result", None
-    r0 = rows[0]
-    return bool(r0["ok"]), str(r0["reason"]), Path(r0["worktree"]) if r0.get("worktree") else None
+def _git_worktree_remove(project_root: Path, worktree: Path) -> None:
+    """Best-effort ``git worktree remove`` so deletes don't leave stale entries."""
+    git_root = git_toplevel(project_root)
+    if git_root is None:
+        return
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            cwd=str(git_root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass

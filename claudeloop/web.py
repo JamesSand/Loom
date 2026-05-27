@@ -1,4 +1,20 @@
-"""Lightweight local web UI for `.RUD` tasks (interview, templates, workers)."""
+"""Lightweight local web UI for `.RUD` tasks.
+
+Three concerns after the agent-loop rewrite:
+
+1. **Task CRUD** - list / create / delete tasks (``<project>/.RUD/<slug>/``).
+   Each new task auto-creates a git worktree at
+   ``<task>/work/<repo>`` on branch ``zhongzhu/<slug>`` (best-effort -
+   non-git project roots just skip the worktree step).
+2. **Project notes** - one ``<project>/.RUD/NOTES.md`` per project,
+   served by ``GET/PUT /api/notes``.
+3. **Claude pane** - launch a tmux + ``claude`` CLI in the task's
+   worktree, automatically capture the Claude Code session UUID from
+   ``~/.claude/projects/<encoded>/``, and let the UI resume any
+   previously-captured session even after tmux is killed.
+
+The only per-task editable template is ``PLAN.md``.
+"""
 
 from __future__ import annotations
 
@@ -10,10 +26,9 @@ import mimetypes
 import os
 import re
 import shlex
-import signal
 import subprocess
-import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -21,30 +36,33 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from claudeloop.openclaw import OpenClawClient, OpenClawConfig, openclaw_status
 from claudeloop.paths import bundled_skills_path, web_static_dir
-from claudeloop.web_projects import WebProjectRegistry
 from claudeloop.rud_task import (
     PLAN,
-    SUCCESS_CONDITION,
-    TASK_PROMPT,
-    WORK_ROOT_REPO_KEY,
+    add_claude_session,
     create_task,
     delete_task,
+    detect_and_persist_worktree,
+    list_session_files,
+    list_task_worktree_statuses,
+    list_task_worktrees,
     list_tasks,
-    list_work_repo_keys,
-    prepare_all_worktrees,
+    list_worktree_candidates,
+    prepare_task_worktree_from,
+    push_worktree_branch,
     read_interview,
     read_meta,
+    read_project_notes,
     read_template,
+    remove_task_worktree,
     reorder_tasks,
-    runs_dir_for_repo,
+    rename_task_meta,
+    session_id_from_path,
     task_root,
+    task_worktree_path,
     update_meta,
-    validate_repo_key,
-    work_path_for_repo_key,
+    worktree_status,
+    write_project_notes,
     write_template,
-    direct_child_git_repos,
-    git_toplevel,
-    prepare_selected_worktrees,
 )
 from claudeloop.tmux_util import (
     capture_pane,
@@ -56,15 +74,18 @@ from claudeloop.tmux_util import (
     tmux_subprocess_env,
     validate_tmux_target,
 )
+from claudeloop.web_projects import WebProjectRegistry
 
 _SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,80}$")
 _STATIC_MIME: dict[str, str] = {
     ".css": "text/css; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
     ".html": "text/html; charset=utf-8",
 }
 
-_WORKER_REPO_DEFAULT = WORK_ROOT_REPO_KEY
+
+# --- naming / filtering helpers --------------------------------------------
 
 
 def _tmux_id_fragment(project_id: str) -> str:
@@ -72,54 +93,22 @@ def _tmux_id_fragment(project_id: str) -> str:
     return frag or "proj"
 
 
-def _safe_tmux_session_name(project_id: str, slug: str, repo: str) -> str:
+def _safe_claude_session_name(project_id: str, slug: str) -> str:
     tid = _tmux_id_fragment(project_id)
-    raw = f"claudeloop-{tid}-{slug}-{repo.replace('/', '-')}"
+    raw = f"claudeloop-claude-{tid}-{slug}"
     safe = re.sub(r"[^A-Za-z0-9_.@-]+", "-", raw).strip("-")
-    return safe[:90] or "claudeloop-task"
-
-
-def _safe_interview_session_name(project_id: str, slug: str) -> str:
-    tid = _tmux_id_fragment(project_id)
-    raw = f"claudeloop-interview-{tid}-{slug}"
-    safe = re.sub(r"[^A-Za-z0-9_.@-]+", "-", raw).strip("-")
-    return safe[:90] or "claudeloop-interview"
-
-
-def _safe_ask_session_name(project_id: str, slug: str) -> str:
-    tid = _tmux_id_fragment(project_id)
-    raw = f"claudeloop-ask-{tid}-{slug}"
-    safe = re.sub(r"[^A-Za-z0-9_.@-]+", "-", raw).strip("-")
-    return safe[:90] or "claudeloop-ask"
-
-
-def _tmux_session_belongs_to_project_fragment(session_name: str, tid: str) -> bool:
-    """True if session name was created for this project id fragment (worker / interview / ask)."""
-    if not session_name or not tid:
-        return False
-    if session_name.startswith("claudeloop-interview-"):
-        return session_name.startswith(f"claudeloop-interview-{tid}-")
-    if session_name.startswith("claudeloop-ask-"):
-        return session_name.startswith(f"claudeloop-ask-{tid}-")
-    if session_name.startswith("claudeloop-"):
-        if session_name.startswith("claudeloop-interview-") or session_name.startswith("claudeloop-ask-"):
-            return False
-        return session_name.startswith(f"claudeloop-{tid}-")
-    return False
+    return safe[:90] or "claudeloop-claude"
 
 
 def _session_name_from_tmux_target(target: str) -> str:
-    """``session:0.0`` → ``session`` (session names we generate never contain ``:``)."""
+    """``session:0.0`` -> ``session`` (we never put ``:`` in session names)."""
     t = (target or "").strip()
-    if not t:
-        return ""
     if ":" in t:
         return t.split(":", 1)[0].strip()
     return t
 
 
 def _task_meta_tmux_session_names(project_root: Path) -> set[str]:
-    """Tmux session base names referenced by tasks under this filesystem project root."""
     out: set[str] = set()
     try:
         root = project_root.resolve()
@@ -128,10 +117,9 @@ def _task_meta_tmux_session_names(project_root: Path) -> set[str]:
     if not root.is_dir():
         return out
     for meta in list_tasks(root):
-        for attr in ("tmux_runner_target", "tmux_evaluator_target", "tmux_interview_target", "tmux_ask_target"):
-            n = _session_name_from_tmux_target(getattr(meta, attr, "") or "")
-            if n:
-                out.add(n)
+        n = _session_name_from_tmux_target(getattr(meta, "tmux_interview_target", "") or "")
+        if n:
+            out.add(n)
     return out
 
 
@@ -140,18 +128,15 @@ def _filter_tmux_sessions_for_project(
     project_id: str,
     project_root: Path | None,
 ) -> list[dict[str, str]]:
-    """Match tmux sessions by (1) web project id fragment in the session name, or (2) task.json pane targets.
-
-    (2) covers switching the UI project after starting a worker: session names embed the *old* project id,
-    but ``tmux_runner_target`` / … under ``project_root`` still point at the live session.
-    """
     tid = _tmux_id_fragment(project_id)
     picked: dict[str, dict[str, str]] = {}
+    # New session-name prefix is "claudeloop-claude-<tid>-..."; we also
+    # accept the legacy "claudeloop-interview-<tid>-..." for tasks created
+    # before the rename.
+    prefixes = (f"claudeloop-claude-{tid}-", f"claudeloop-interview-{tid}-")
     for s in sessions:
         name = str(s.get("name", ""))
-        if not name:
-            continue
-        if tid and _tmux_session_belongs_to_project_fragment(name, tid):
+        if name and tid and any(name.startswith(p) for p in prefixes):
             picked[name] = s
     if project_root is not None:
         for nm in _task_meta_tmux_session_names(project_root):
@@ -163,7 +148,6 @@ def _filter_tmux_sessions_for_project(
 
 
 def _launch_root_child_dirs(launch_root: Path, *, limit: int = 200) -> list[dict[str, str]]:
-    """Immediate non-hidden subdirectories of the server launch directory (for Add-project quick pick)."""
     out: list[dict[str, str]] = []
     try:
         root = launch_root.resolve()
@@ -191,195 +175,7 @@ def _launch_root_child_dirs(launch_root: Path, *, limit: int = 200) -> list[dict
     return out
 
 
-def _git_run(args: list[str], cwd: Path, timeout: int = 30) -> tuple[bool, str]:
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
-    output = "\n".join(x for x in (result.stdout.strip(), result.stderr.strip()) if x)
-    return result.returncode == 0, output
-
-
-def _push_worktree_branch(project_root: Path, slug: str, repo: str, project_id: str) -> dict[str, Any]:
-    td = task_root(project_root, slug)
-    wt = work_path_for_repo_key(td, repo)
-    if wt is None or not wt.is_dir():
-        return {"ok": False, "error": f"Worktree missing or invalid repo key: {repo!r}"}
-
-    branch = _safe_tmux_session_name(project_id, slug, repo)
-    ok, out = _git_run(["rev-parse", "--is-inside-work-tree"], wt)
-    if not ok:
-        return {"ok": False, "error": out or "Not a git worktree", "branch": branch}
-    ok, remotes = _git_run(["remote"], wt)
-    if not ok or "origin" not in remotes.splitlines():
-        return {"ok": False, "error": "No git remote named origin", "branch": branch}
-
-    ok, current = _git_run(["branch", "--show-current"], wt)
-    if not ok:
-        return {"ok": False, "error": current, "branch": branch}
-    if current.strip() != branch:
-        ok, exists = _git_run(["rev-parse", "--verify", "--quiet", branch], wt)
-        switch_args = ["switch", branch] if ok else ["switch", "-c", branch]
-        ok, switched = _git_run(switch_args, wt)
-        if not ok:
-            return {"ok": False, "error": switched, "branch": branch}
-
-    ok, status = _git_run(["status", "--porcelain"], wt)
-    if not ok:
-        return {"ok": False, "error": status, "branch": branch}
-    committed = False
-    commit_output = "No local changes to commit."
-    if status.strip():
-        ok, add_out = _git_run(["add", "-A"], wt)
-        if not ok:
-            return {"ok": False, "error": add_out, "branch": branch}
-        message = f"Complete claudeloop task {slug}"
-        ok, commit_output = _git_run(["commit", "-m", message], wt, timeout=60)
-        if not ok:
-            return {"ok": False, "error": commit_output, "branch": branch}
-        committed = True
-
-    ok, push_output = _git_run(["push", "-u", "origin", branch], wt, timeout=120)
-    if not ok:
-        return {"ok": False, "error": push_output, "branch": branch, "committed": committed}
-    return {
-        "ok": True,
-        "branch": branch,
-        "worktree": str(wt),
-        "committed": committed,
-        "commit_output": commit_output,
-        "push_output": push_output,
-    }
-
-
-def _push_all_worktree_branches(project_root: Path, slug: str, project_id: str) -> dict[str, Any]:
-    td = task_root(project_root, slug)
-    repos = list_work_repo_keys(td)
-    results = []
-    for repo in repos:
-        row = _push_worktree_branch(project_root, slug, repo, project_id)
-        row["repo"] = repo
-        results.append(row)
-    return {
-        "ok": bool(results) and all(bool(r.get("ok")) for r in results),
-        "count": len(results),
-        "results": results,
-    }
-
-
-def _task_state_prompt(task_dir: Path, worktree_dir: Path | None = None) -> str:
-    plan_path = (task_dir / PLAN).resolve()
-    worktree_note = (
-        f"\n- Code edits should happen in this worktree: {worktree_dir.resolve()}"
-        if worktree_dir
-        else ""
-    )
-    return f"""## Task State Discipline
-- The authoritative task directory is: {task_dir.resolve()}
-- The authoritative plan/progress file is: {plan_path}
-- Treat every instruction that mentions PLAN.md as referring to that exact file.
-- Keep a `Progress Log` section in {plan_path}; append concise dated entries there as work progresses.
-- Do not create or update scattered task-management files in the repo/worktree, such as TODO.md, NOTES.md, PROGRESS.md, status logs, scratch plans, or duplicate PLAN.md files.
-- Only source-code and implementation artifacts belong in the repo/worktree. Task status, notes, decisions, and next steps belong in {plan_path}.{worktree_note}
-"""
-
-
-def _build_interview_prompt(project_root: Path, slug: str) -> str:
-    meta = read_meta(project_root, slug)
-    if not meta:
-        return ""
-    td = task_root(project_root, slug)
-    skills = ""
-    if meta.skills_path:
-        sp = Path(meta.skills_path)
-        if sp.is_file():
-            skills = sp.read_text(encoding="utf-8", errors="replace")[:12000]
-    return f"""You are running claudeloop deep-interview for this task.
-
-You are in the task directory:
-{td}
-
-General goal:
-{meta.general_goal}
-
-Default skills:
----
-{skills or "(none)"}
----
-
-Your job:
-1. Interview the user interactively in this Claude Code pane.
-2. Ask exactly one high-leverage question at a time.
-3. Focus on missing scope, constraints, success criteria, tests, non-goals, and repo/worktree details.
-4. Keep notes in {td / "INTERVIEW.md"}.
-5. When the task is clear enough, write or overwrite exactly these three files:
-   - {td / TASK_PROMPT}
-   - {td / SUCCESS_CONDITION}
-   - {td / PLAN}
-
-File requirements:
-- TASK_PROMPT.md: full autonomous worker prompt with context, constraints, and concrete implementation goal.
-- SUCCESS_CONDITION.md: concrete success criteria and bash test commands in fenced ```bash blocks.
-- PLAN.md: concise implementation checklist plus a `Progress Log` section.
-- The generated TASK_PROMPT.md must instruct workers to keep all task status, notes, decisions, and progress updates in {td / PLAN}; do not let them create scattered TODO/NOTES/PROGRESS/status files in the repo.
-
-Important constraints:
-- Work only in this task directory while interviewing.
-- Do not modify source code repositories during interview.
-- Do not start the worker. The web UI will start claudeloop tmux after the three files are ready.
-- If information is missing, ask the user one question and wait.
-
-{_task_state_prompt(td)}
-
-Begin by reading the current files, then ask the first question or, if already clear, write the three files."""
-
-
-def _build_ask_prompt(project_root: Path, slug: str, repo: str = "") -> str:
-    meta = read_meta(project_root, slug)
-    if not meta:
-        return ""
-    td = task_root(project_root, slug)
-    selected_worktree = work_path_for_repo_key(td, repo) if repo and validate_repo_key(repo) else None
-    worktree_lines = []
-    for key in list_work_repo_keys(td):
-        path = work_path_for_repo_key(td, key)
-        if path:
-            worktree_lines.append(f"- {key}: {path}")
-    selected_note = f"\nSelected repo/worktree: {repo} -> {selected_worktree}" if selected_worktree else ""
-    return f"""You are a claudeloop Ask assistant for this task.
-
-You are running in the task directory:
-{td}
-
-General goal:
-{meta.general_goal}
-
-You may use all task-local context to answer questions. Inspect broadly when needed:
-- PLAN.md: current task state, progress, blockers, and next steps
-- TASK_PROMPT.md: worker prompt
-- SUCCESS_CONDITION.md: evaluator contract
-- INTERVIEW.md: deep-interview notes, if any
-- runs/: worker controller logs, process metadata, session state, and run outputs
-- work/: all task worktrees and all code/files under them
-- any other files under this task directory that help explain what happened
-
-Known worktrees:
-{chr(10).join(worktree_lines) if worktree_lines else "(none yet)"}{selected_note}
-
-Behavior:
-- Answer the user's questions about what changed, what is running, and what the worker/evaluator did.
-- Prefer reading PLAN.md, runs/, work/, and relevant source files before answering.
-- You can inspect the full worktree/code contents to explain changes, current behavior, errors, and next steps.
-- Do not modify source code, task files, tmux sessions, or git state unless the user explicitly asks.
-- If the user asks for a task-state update, write it only to PLAN.md in this task directory.
-- Keep answers concise and grounded in files/logs you inspected.
-"""
+# --- HTTP response helpers --------------------------------------------------
 
 
 def _json_bytes(obj: Any, status: int = 200) -> tuple[int, bytes, list[tuple[str, str]]]:
@@ -427,369 +223,79 @@ def _safe_static_path(static_root: Path, url_path: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-class RunRegistry:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._runs: dict[str, subprocess.Popen[Any]] = {}
-
-    def _key(self, project_id: str, slug: str, repo: str) -> str:
-        return f"{project_id}::{slug}::{repo}"
-
-    def start(
-        self,
-        project_root: Path,
-        project_id: str,
-        slug: str,
-        repo: str,
-        *,
-        mode: str,
-        max_iters: int,
-        model: str,
-    ) -> tuple[bool, str]:
-        key = self._key(project_id, slug, repo)
-        with self._lock:
-            if key in self._runs:
-                p = self._runs[key]
-                if p.poll() is None:
-                    return False, "Worker already running for this repo"
-                del self._runs[key]
-
-        td = task_root(project_root, slug)
-        wt_path = work_path_for_repo_key(td, repo)
-        if wt_path is None or not wt_path.is_dir():
-            return False, f"Worktree missing or invalid repo key: {repo!r}"
-        wt = wt_path
-        for name in (TASK_PROMPT, SUCCESS_CONDITION, PLAN):
-            if not (td / name).is_file():
-                return False, f"Missing template {name}"
-
-        runs = runs_dir_for_repo(td, repo)
-        if runs is None:
-            return False, "invalid repo key"
-        log_dir = runs / "agent_logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = runs / "worker.log"
-        meta = read_meta(project_root, slug)
-        extra_parts = [_task_state_prompt(td, wt)]
-        if meta and meta.skills_path:
-            sp = Path(meta.skills_path)
-            if sp.is_file():
-                extra_parts.append(
-                    "## Default skills\n"
-                    + sp.read_text(encoding="utf-8", errors="replace")[:12000]
-                )
-        extra = "\n\n".join(part.strip() for part in extra_parts if part.strip())
-
-        is_tmux = mode == "tmux"
-        session_name = _safe_tmux_session_name(project_id, slug, repo) if is_tmux else ""
-        cmd: list[str] = [
-            sys.executable,
-            "-m",
-            "claudeloop",
-            "tmux" if is_tmux else "run",
-            "--prompt",
-            str((td / TASK_PROMPT).resolve()),
-            "--success",
-            str((td / SUCCESS_CONDITION).resolve()),
-            "--plan",
-            str((td / PLAN).resolve()),
-            "--log-dir",
-            str(log_dir.resolve()),
-            "--max-rounds" if is_tmux else "--max-iters",
-            str(max_iters),
-            "--model",
-            model,
-            "--dangerously-skip-permissions",
-            "--effort",
-            "max",
-            "--no-commit",
-        ]
-        if is_tmux:
-            cmd += ["--session-name", session_name]
-        if extra:
-            cmd += ["--additional-prompt", extra]
-
-        f = open(log_path, "ab", buffering=0)  # noqa: SIM115
-        env = tmux_subprocess_env()
-        env.update(
-            {
-                "COLUMNS": "240",
-                "LINES": "64",
-                "RICH_WIDTH": "240",
-            }
-        )
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(wt),
-                stdin=subprocess.DEVNULL,
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                env=env,
-                start_new_session=True,
-            )
-        except OSError as e:
-            f.close()
-            return False, str(e)
-
-        with self._lock:
-            self._runs[key] = proc
-        meta_update: dict[str, str] = {}
-        if is_tmux and session_name:
-            meta_update = {
-                "tmux_runner_target": f"{session_name}:0.0",
-                "tmux_evaluator_target": f"{session_name}:0.1",
-            }
-            update_meta(project_root, slug, **meta_update)
-        (runs / "process.json").write_text(
-            json.dumps(
-                {
-                    "pid": proc.pid,
-                    "mode": mode,
-                    "repo": repo,
-                    "cwd": str(wt),
-                    "cmd": cmd,
-                    **meta_update,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        threading.Thread(target=lambda: self._wait_and_close(key, proc, f), daemon=True).start()
-        return True, str(log_path)
-
-    def stop(self, project_root: Path, project_id: str, slug: str, repo: str) -> dict[str, Any]:
-        key = self._key(project_id, slug, repo)
-        stopped_proc = False
-        proc_msg = "not running in registry"
-        with self._lock:
-            proc = self._runs.pop(key, None)
-        if proc is not None:
-            stopped_proc, proc_msg = self._stop_process(proc)
-
-        if proc is None:
-            from_file, from_file_msg = self._stop_process_from_file(project_root, slug, repo)
-            stopped_proc = stopped_proc or from_file
-            proc_msg = from_file_msg
-
-        session_name = _safe_tmux_session_name(project_id, slug, repo)
-        stopped_tmux, tmux_msg = self._kill_tmux_session(session_name)
-        update_meta(project_root, slug, tmux_runner_target="", tmux_evaluator_target="")
-        return {
-            "ok": True,
-            "process_stopped": stopped_proc,
-            "process_message": proc_msg,
-            "tmux_stopped": stopped_tmux,
-            "tmux_message": tmux_msg,
-            "tmux_session": session_name,
-        }
-
-    def _stop_process(self, proc: subprocess.Popen[Any]) -> tuple[bool, str]:
-        if proc.poll() is not None:
-            return False, f"already exited with {proc.returncode}"
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return False, "process already gone"
-        except OSError:
-            proc.terminate()
-        try:
-            proc.wait(timeout=8)
-            return True, "terminated"
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                proc.kill()
-            return True, "killed"
-
-    def _stop_process_from_file(self, project_root: Path, slug: str, repo: str) -> tuple[bool, str]:
-        td = task_root(project_root, slug)
-        rd = runs_dir_for_repo(td, repo)
-        proc_file = (rd / "process.json") if rd else None
-        if proc_file is None or not proc_file.is_file():
-            return False, "no process file"
-        try:
-            data = json.loads(proc_file.read_text(encoding="utf-8"))
-            pid = int(data.get("pid", 0))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return False, "invalid process file"
-        if pid <= 1:
-            return False, "invalid pid"
-        cmdline_path = Path(f"/proc/{pid}/cmdline")
-        try:
-            cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace")
-        except OSError:
-            return False, "process already gone"
-        ok, reason = self._process_file_matches_task(data, pid, cmdline, td, rd)
-        if not ok:
-            return False, reason
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return False, "process already gone"
-        except OSError as exc:
-            return False, str(exc)
-        return True, "terminated from process file"
-
-    def _process_file_matches_task(
-        self,
-        data: dict[str, Any],
-        pid: int,
-        cmdline: str,
-        task_dir: Path,
-        runs_dir: Path | None,
-    ) -> tuple[bool, str]:
-        if pid == os.getpid():
-            return False, "process file points at web server; skipped"
-        if "claudeloop tmux" not in cmdline and "claudeloop run" not in cmdline:
-            return False, "pid is not a claudeloop worker; skipped"
-        expected_cmd = data.get("cmd", [])
-        if not isinstance(expected_cmd, list):
-            return False, "invalid process command"
-        expected_prompt = str((task_dir / TASK_PROMPT).resolve())
-        expected_log_dir = str((runs_dir / "agent_logs").resolve()) if runs_dir else ""
-        if expected_prompt not in cmdline:
-            return False, "pid belongs to different task; skipped"
-        if expected_log_dir and expected_log_dir not in cmdline:
-            return False, "pid belongs to different run dir; skipped"
-        return True, "matched"
-
-    def _kill_tmux_session(self, session_name: str) -> tuple[bool, str]:
-        try:
-            result = subprocess.run(
-                ["tmux", "kill-session", "-t", session_name],
-                capture_output=True,
-                text=True,
-                env=tmux_subprocess_env(),
-                timeout=8,
-            )
-        except FileNotFoundError:
-            return False, "tmux not on PATH"
-        except subprocess.TimeoutExpired:
-            return False, "tmux kill timed out"
-        if result.returncode == 0:
-            return True, "tmux session killed"
-        msg = (result.stderr or result.stdout or "tmux session not found").strip()
-        return False, msg
-
-    def _wait_and_close(self, key: str, proc: subprocess.Popen[Any], logf) -> None:
-        try:
-            proc.wait()
-        finally:
-            try:
-                logf.close()
-            except Exception:
-                pass
-            with self._lock:
-                if self._runs.get(key) is proc:
-                    del self._runs[key]
-
-    def status(self, project_root: Path, project_id: str, slug: str, repo: str) -> dict[str, Any]:
-        key = self._key(project_id, slug, repo)
-        with self._lock:
-            p = self._runs.get(key)
-        rc = p.poll() if p is not None else None
-        running = bool(p is not None and rc is None)
-        status: dict[str, Any] = {
-            "running": running,
-            "pid": p.pid if p is not None else None,
-            "returncode": rc,
-            "session": self._read_session_status(project_root, slug, repo),
-        }
-        if p is None:
-            status.update(self._read_process_status(project_root, slug, repo))
-        return status
-
-    def _read_session_status(self, project_root: Path, slug: str, repo: str) -> dict[str, Any]:
-        rd = runs_dir_for_repo(task_root(project_root, slug), repo)
-        session_path = rd / "agent_logs" / "session.json" if rd else None
-        if session_path is None or not session_path.is_file():
-            return {}
-        try:
-            data = json.loads(session_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        completed = int(data.get("completed_iteration", 0) or 0)
-        max_rounds = int(data.get("max_rounds", 0) or 0)
-        if not max_rounds and rd:
-            max_rounds = self._read_max_rounds_from_process_file(rd)
-        state = str(data.get("status", "unknown"))
-        current = int(data.get("current_round", 0) or 0)
-        if not current:
-            current = min(completed + 1, max_rounds) if state == "running" and max_rounds else completed
-        return {
-            "status": state,
-            "completed_iteration": completed,
-            "current_round": current,
-            "max_rounds": max_rounds,
-            "updated_at": data.get("updated_at", ""),
-            "tmux_session_name": data.get("tmux_session_name", ""),
-            "tmux_evaluator_target": data.get("tmux_evaluator_target", ""),
-        }
-
-    def _read_max_rounds_from_process_file(self, runs_dir: Path) -> int:
-        proc_file = runs_dir / "process.json"
-        if not proc_file.is_file():
-            return 0
-        try:
-            data = json.loads(proc_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return 0
-        cmd = data.get("cmd", [])
-        if not isinstance(cmd, list):
-            return 0
-        for flag in ("--max-rounds", "--max-iters"):
-            if flag in cmd:
-                idx = cmd.index(flag)
-                try:
-                    return int(cmd[idx + 1])
-                except (IndexError, TypeError, ValueError):
-                    return 0
-        return 0
-
-    def _read_process_status(self, project_root: Path, slug: str, repo: str) -> dict[str, Any]:
-        rd = runs_dir_for_repo(task_root(project_root, slug), repo)
-        proc_file = rd / "process.json" if rd else None
-        if proc_file is None or not proc_file.is_file():
-            return {}
-        try:
-            data = json.loads(proc_file.read_text(encoding="utf-8"))
-            pid = int(data.get("pid", 0) or 0)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return {}
-        if pid <= 1:
-            return {}
-        proc_path = Path(f"/proc/{pid}")
-        if not proc_path.exists():
-            return {"pid": pid, "running": False, "returncode": None}
-        try:
-            cmdline = (proc_path / "cmdline").read_bytes().replace(b"\x00", b" ").decode(
-                "utf-8", errors="replace",
-            )
-        except OSError:
-            return {"pid": pid, "running": False, "returncode": None}
-        ok, _ = self._process_file_matches_task(data, pid, cmdline, task_root(project_root, slug), rd)
-        if not ok:
-            return {"pid": pid, "running": False, "returncode": None}
-        return {"pid": pid, "running": True, "returncode": None}
-
-    def read_log_tail(self, project_root: Path, slug: str, repo: str, lines: int = 80) -> str:
-        td = task_root(project_root, slug)
-        rd = runs_dir_for_repo(td, repo)
-        path = (rd / "worker.log") if rd else None
-        if path is None or not path.is_file():
-            return ""
-        try:
-            data = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""
-        return "\n".join(data.splitlines()[-lines:])
+# --- Claude prompt builder --------------------------------------------------
 
 
-class InterviewRegistry:
+def _build_claude_prompt(project_root: Path, slug: str) -> str:
+    meta = read_meta(project_root, slug)
+    if not meta:
+        return ""
+    td = task_root(project_root, slug)
+    wt = task_worktree_path(project_root, slug)
+    wt_line = f"Worktree (branch {meta.branch or '(unset)'}): {wt}" if wt else "Worktree: (none)"
+    skills = ""
+    if meta.skills_path:
+        sp = Path(meta.skills_path)
+        if sp.is_file():
+            skills = sp.read_text(encoding="utf-8", errors="replace")[:12000]
+    plan_path = td / PLAN
+    return f"""You are running claudeloop's Claude pane for this task.
+
+You are in the task directory:
+{td}
+
+General goal:
+{meta.general_goal}
+
+{wt_line}
+
+Default skills:
+---
+{skills or "(none)"}
+---
+
+How you should help the user:
+1. If {plan_path} is empty or vague, run a short deep-interview - ask one
+   high-leverage question at a time about scope, constraints, acceptance,
+   tests, non-goals. Capture decisions in {td / "INTERVIEW.md"}.
+2. Once the goal is clear, write or overwrite {plan_path} with:
+   - Goal, Constraints / non-goals, Acceptance, Next steps (checkbox list),
+     Progress Log section the user updates as they work.
+3. After PLAN.md is solid, the user will typically continue this same
+   session and drive the work with ``/goal`` against PLAN.md.
+
+Behavioural constraints:
+- Do not create scattered TODO / PROGRESS / status files in the repo;
+  PLAN.md is the only task-state file.
+- Project-scoped scratch lives in the project's NOTES.md (handled by the
+  user via the web UI), not inside the worktree.
+
+Begin by reading {plan_path} and {td / "INTERVIEW.md"}, then either ask
+the first interview question or, if PLAN.md is already detailed enough,
+acknowledge that and wait for ``/goal``.
+"""
+
+
+# --- Claude tmux registry ---------------------------------------------------
+
+
+class ClaudeRegistry:
+    """Manage tmux + claude CLI panes per (project, task).
+
+    A pane's lifecycle:
+    1. ``start`` opens a tmux session, launches ``claude``, sends the
+       deep-interview prompt as a bracketed paste, and kicks off a
+       background watcher.
+    2. The watcher polls ``~/.claude/projects/<encoded-cwd>/`` for a new
+       ``<uuid>.jsonl`` and, when one appears, records the UUID via
+       ``add_claude_session``.  This is what lets us offer a Resume button.
+    3. ``stop`` kills the tmux session but leaves the session UUIDs in
+       metadata so they remain resumable from the CLI.
+    4. ``resume`` re-launches ``claude --resume <uuid>`` in a fresh tmux
+       pane.  Useful when the original tmux was killed but the session
+       transcript on disk is still good.
+    """
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._runs: dict[str, subprocess.Popen[Any]] = {}
@@ -798,7 +304,14 @@ class InterviewRegistry:
     def _registry_key(project_id: str, slug: str) -> str:
         return f"{project_id}::{slug}"
 
-    def start(self, project_root: Path, project_id: str, slug: str) -> dict[str, Any]:
+    def start(
+        self,
+        project_root: Path,
+        project_id: str,
+        slug: str,
+        *,
+        resume_session_id: str = "",
+    ) -> dict[str, Any]:
         meta = read_meta(project_root, slug)
         if not meta:
             return {"ok": False, "error": "Task not found"}
@@ -806,27 +319,37 @@ class InterviewRegistry:
         if not td.is_dir():
             return {"ok": False, "error": "Task directory missing"}
 
-        session_name = _safe_interview_session_name(project_id, slug)
+        # Run claude inside the worktree when we have one - that's where
+        # the user will eventually want /goal to operate.
+        worktree = task_worktree_path(project_root, slug)
+        cwd = worktree if worktree is not None else td
+
+        session_name = _safe_claude_session_name(project_id, slug)
         target = f"{session_name}:0.0"
         if self._tmux_session_exists(session_name):
+            if resume_session_id:
+                return {
+                    "ok": False,
+                    "error": "Stop the running tmux pane before resuming another session.",
+                    "target": target,
+                    "session": session_name,
+                }
             update_meta(project_root, slug, tmux_interview_target=target)
-            return {"ok": True, "target": target, "session": session_name, "already_running": True}
+            return {
+                "ok": True,
+                "target": target,
+                "session": session_name,
+                "cwd": str(cwd),
+                "already_running": True,
+            }
 
-        cmd = [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            session_name,
-            "-x",
-            "240",
-            "-y",
-            "64",
-        ]
+        # Snapshot existing session files so the watcher can spot the new one.
+        existing_files = {p.name for p in list_session_files(cwd)}
+
         try:
             subprocess.run(
-                cmd,
-                cwd=str(td),
+                ["tmux", "new-session", "-d", "-s", session_name, "-x", "240", "-y", "64"],
+                cwd=str(cwd),
                 capture_output=True,
                 text=True,
                 env=tmux_subprocess_env(),
@@ -838,7 +361,7 @@ class InterviewRegistry:
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             return {"ok": False, "error": str(e)}
 
-        claude_cmd = [
+        claude_cmd: list[str] = [
             "claude",
             "--model",
             meta.interview_model or "claude-sonnet-4-6",
@@ -846,10 +369,12 @@ class InterviewRegistry:
             "--effort",
             "max",
         ]
+        if resume_session_id:
+            claude_cmd += ["--resume", resume_session_id]
         try:
             proc = subprocess.Popen(
                 ["tmux", "send-keys", "-t", target, shlex.join(claude_cmd), "Enter"],
-                cwd=str(td),
+                cwd=str(cwd),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 env=tmux_subprocess_env(),
@@ -861,22 +386,41 @@ class InterviewRegistry:
             self._runs[self._registry_key(project_id, slug)] = proc
 
         update_meta(project_root, slug, tmux_interview_target=target)
-        threading.Thread(
-            target=self._paste_prompt_after_startup,
-            args=(project_root, slug, target),
-            daemon=True,
-        ).start()
+        if resume_session_id:
+            add_claude_session(project_root, slug, resume_session_id)
+            threading.Thread(
+                target=self._watch_for_session_id,
+                args=(project_root, slug, cwd, existing_files),
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(
+                target=self._paste_prompt_and_watch_session,
+                args=(project_root, slug, target, cwd, existing_files),
+                daemon=True,
+            ).start()
         return {
             "ok": True,
             "target": target,
             "session": session_name,
+            "cwd": str(cwd),
+            "resumed_session_id": resume_session_id or None,
             "already_running": False,
-            "prompt_pending": True,
+            "prompt_pending": not bool(resume_session_id),
         }
 
     def stop(self, project_root: Path, project_id: str, slug: str) -> dict[str, Any]:
-        session_name = _safe_interview_session_name(project_id, slug)
+        session_name = _safe_claude_session_name(project_id, slug)
         stopped, msg = self._kill_tmux_session(session_name)
+        # Also clean up the legacy interview session name in case this task
+        # was created before the rename.
+        legacy_name = re.sub(
+            r"^claudeloop-claude-",
+            "claudeloop-interview-",
+            session_name,
+        )
+        if legacy_name != session_name:
+            self._kill_tmux_session(legacy_name)
         update_meta(project_root, slug, tmux_interview_target="")
         with self._lock:
             self._runs.pop(self._registry_key(project_id, slug), None)
@@ -886,6 +430,8 @@ class InterviewRegistry:
             "tmux_message": msg,
             "tmux_session": session_name,
         }
+
+    # --- helpers ---
 
     def _tmux_session_exists(self, session_name: str) -> bool:
         try:
@@ -899,6 +445,14 @@ class InterviewRegistry:
         except (OSError, subprocess.TimeoutExpired):
             return False
         return r.returncode == 0
+
+    def session_status(self, project_id: str, slug: str) -> dict[str, Any]:
+        session_name = _safe_claude_session_name(project_id, slug)
+        return {
+            "session": session_name,
+            "target": f"{session_name}:0.0",
+            "tmux_alive": self._tmux_session_exists(session_name),
+        }
 
     def _kill_tmux_session(self, session_name: str) -> tuple[bool, str]:
         try:
@@ -918,10 +472,8 @@ class InterviewRegistry:
         return False, (r.stderr or r.stdout or "tmux session not found").strip()
 
     def _wait_for_claude_ready(self, target: str, timeout: float = 45.0) -> None:
-        import time
-
         deadline = time.time() + timeout
-        markers = ("❯", "╭", "tips:", "/help")
+        markers = ("\u276f", "\u256d", "tips:", "/help")
         while time.time() < deadline:
             ok, text = capture_pane(target, 80)
             if ok and any(m in text.lower() for m in markers):
@@ -929,145 +481,54 @@ class InterviewRegistry:
                 return
             time.sleep(2)
 
-    def _paste_prompt_after_startup(self, project_root: Path, slug: str, target: str) -> None:
-        import time
+    def _watch_for_session_id(
+        self,
+        project_root: Path,
+        slug: str,
+        cwd: Path,
+        existing_filenames: set[str],
+    ) -> None:
+        """Poll ~/.claude/projects/<encoded>/ for a freshly-written session file."""
+        deadline = time.time() + 90.0
+        while time.time() < deadline:
+            for p in list_session_files(cwd):
+                if p.name not in existing_filenames:
+                    sid = session_id_from_path(p)
+                    if sid:
+                        add_claude_session(project_root, slug, sid)
+                        return
+            time.sleep(2)
 
+    def _paste_prompt_and_watch_session(
+        self,
+        project_root: Path,
+        slug: str,
+        target: str,
+        cwd: Path,
+        existing_filenames: set[str],
+    ) -> None:
         time.sleep(5)
         self._wait_for_claude_ready(target, timeout=90.0)
-        prompt = _build_interview_prompt(project_root, slug)
-        if not prompt:
-            return
-        ok, _ = send_pane_text(target, prompt, submit=False)
-        if not ok:
-            return
-        # Claude Code often needs an empty-line submit after bracketed paste.
-        time.sleep(0.3)
-        send_pane_key(target, "Enter")
-        time.sleep(0.1)
-        send_pane_key(target, "Enter")
+        prompt = _build_claude_prompt(project_root, slug)
+        if prompt:
+            ok, _ = send_pane_text(target, prompt, submit=False)
+            if ok:
+                # Claude Code often needs an empty-line submit after bracketed paste.
+                time.sleep(0.3)
+                send_pane_key(target, "Enter")
+                time.sleep(0.1)
+                send_pane_key(target, "Enter")
+        self._watch_for_session_id(project_root, slug, cwd, existing_filenames)
 
 
-class AskRegistry(InterviewRegistry):
-    def start(self, project_root: Path, project_id: str, slug: str, repo: str = "") -> dict[str, Any]:
-        meta = read_meta(project_root, slug)
-        if not meta:
-            return {"ok": False, "error": "Task not found"}
-        repo = repo or _WORKER_REPO_DEFAULT
-        if repo and not validate_repo_key(repo):
-            return {"ok": False, "error": "invalid repo key"}
-        td = task_root(project_root, slug)
-        if not td.is_dir():
-            return {"ok": False, "error": "Task directory missing"}
-        ask_cwd = work_path_for_repo_key(td, repo) or td
-        ask_cwd.mkdir(parents=True, exist_ok=True)
-
-        session_name = _safe_ask_session_name(project_id, slug)
-        target = f"{session_name}:0.0"
-        if self._tmux_session_exists(session_name):
-            update_meta(project_root, slug, tmux_ask_target=target)
-            return {"ok": True, "target": target, "session": session_name, "already_running": True}
-
-        cmd = [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            session_name,
-            "-x",
-            "240",
-            "-y",
-            "64",
-        ]
-        try:
-            subprocess.run(
-                cmd,
-                cwd=str(ask_cwd),
-                capture_output=True,
-                text=True,
-                env=tmux_subprocess_env(),
-                check=True,
-                timeout=8,
-            )
-        except FileNotFoundError:
-            return {"ok": False, "error": "tmux not on PATH"}
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            return {"ok": False, "error": str(e)}
-
-        claude_cmd = [
-            "claude",
-            "--model",
-            "claude-opus-4-7",
-            "--dangerously-skip-permissions",
-            "--effort",
-            "max",
-        ]
-        try:
-            proc = subprocess.Popen(
-                ["tmux", "send-keys", "-t", target, shlex.join(claude_cmd), "Enter"],
-                cwd=str(ask_cwd),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=tmux_subprocess_env(),
-                start_new_session=True,
-            )
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
-        with self._lock:
-            self._runs[self._registry_key(project_id, slug)] = proc
-
-        update_meta(project_root, slug, tmux_ask_target=target)
-        threading.Thread(
-            target=self._paste_ask_prompt_after_startup,
-            args=(project_root, slug, repo, target),
-            daemon=True,
-        ).start()
-        return {
-            "ok": True,
-            "target": target,
-            "session": session_name,
-            "already_running": False,
-            "prompt_pending": True,
-        }
-
-    def stop(self, project_root: Path, project_id: str, slug: str) -> dict[str, Any]:
-        session_name = _safe_ask_session_name(project_id, slug)
-        stopped, msg = self._kill_tmux_session(session_name)
-        update_meta(project_root, slug, tmux_ask_target="")
-        with self._lock:
-            self._runs.pop(self._registry_key(project_id, slug), None)
-        return {
-            "ok": True,
-            "tmux_stopped": stopped,
-            "tmux_message": msg,
-            "tmux_session": session_name,
-        }
-
-    def _paste_ask_prompt_after_startup(self, project_root: Path, slug: str, repo: str, target: str) -> None:
-        import time
-
-        time.sleep(5)
-        self._wait_for_claude_ready(target, timeout=90.0)
-        prompt = _build_ask_prompt(project_root, slug, repo)
-        if not prompt:
-            return
-        ok, _ = send_pane_text(target, prompt, submit=False)
-        if not ok:
-            return
-        time.sleep(0.3)
-        send_pane_key(target, "Enter")
-        time.sleep(0.1)
-        send_pane_key(target, "Enter")
+# --- HTTP handler factory ---------------------------------------------------
 
 
 def make_handler(
     project_registry: WebProjectRegistry,
     launch_root: Path,
     default_skills: Path,
-    default_work_dirs: list[Path],
-    registry: RunRegistry,
-    interview_registry: InterviewRegistry,
-    ask_registry: AskRegistry,
-    interview_backend_default: str,
+    claude_registry: ClaudeRegistry,
     openclaw_client: OpenClawClient,
     auth_token: str = "",
     *,
@@ -1104,66 +565,6 @@ def make_handler(
             if pth is None:
                 return None, None
             return pth, pid
-
-        def _work_dirs_for(self, root: Path, project_id: str) -> list[Path]:
-            custom = pr.get_default_work_dirs(project_id)
-            if custom:
-                return custom
-            if default_work_dirs:
-                return list(default_work_dirs)
-            return [root]
-
-        def _effective_work_dirs_for_task(self, root: Path, project_id: str, meta: Any) -> list[Path]:
-            if meta.work_dirs:
-                out: list[Path] = []
-                for item in meta.work_dirs:
-                    try:
-                        out.append(Path(str(item)).expanduser().resolve())
-                    except OSError:
-                        continue
-                if out:
-                    return out
-            return self._work_dirs_for(root, project_id)
-
-        def _worktree_candidates(self, work_dirs: list[Path]) -> dict[str, Any]:
-            groups: list[dict[str, Any]] = []
-            for raw in work_dirs:
-                try:
-                    work_dir = raw.expanduser().resolve()
-                except OSError:
-                    groups.append({"workDir": str(raw), "kind": "invalid", "repos": [], "reason": "invalid path"})
-                    continue
-                top = git_toplevel(work_dir)
-                if top:
-                    groups.append(
-                        {
-                            "workDir": str(work_dir),
-                            "kind": "repo",
-                            "repos": [{"name": top.name, "repoKey": top.name, "path": str(top.resolve())}],
-                        }
-                    )
-                    continue
-                repos = [
-                    {"name": p.name, "repoKey": p.name, "path": str(p.resolve())}
-                    for p in direct_child_git_repos(work_dir)
-                ]
-                groups.append(
-                    {
-                        "workDir": str(work_dir),
-                        "kind": "container",
-                        "repos": repos,
-                        "reason": "" if repos else "no direct child git repositories",
-                    }
-                )
-            needs_selection = any(g.get("kind") == "container" and len(g.get("repos") or []) > 1 for g in groups)
-            auto_work_dirs: list[str] = []
-            for g in groups:
-                repos = g.get("repos") or []
-                if g.get("kind") == "repo" and repos:
-                    auto_work_dirs.append(str(repos[0]["path"]))
-                elif g.get("kind") == "container" and len(repos) == 1:
-                    auto_work_dirs.append(str(repos[0]["path"]))
-            return {"groups": groups, "needsSelection": needs_selection, "autoWorkDirs": auto_work_dirs}
 
         def _bad_project(self) -> None:
             st, b, h = _json_bytes(
@@ -1203,6 +604,53 @@ def make_handler(
             self.wfile.write(body)
             return False
 
+        def _claude_session_summary(self, project_id: str, slug: str, meta) -> dict[str, Any]:
+            cwd_str = (meta.worktree_path or "").strip() or str(task_root(pr.get_path(project_id), slug))
+            try:
+                cwd = Path(cwd_str)
+            except OSError:
+                cwd = Path(cwd_str)
+            files_by_id: dict[str, dict[str, Any]] = {}
+            for p in list_session_files(cwd):
+                sid = session_id_from_path(p)
+                if not sid:
+                    continue
+                try:
+                    stat = p.stat()
+                except OSError:
+                    continue
+                files_by_id[sid] = {
+                    "id": sid,
+                    "path": str(p),
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                }
+            # Preserve task-meta order (history of who-was-spawned-when)
+            # but enrich with on-disk info.
+            ordered = []
+            seen: set[str] = set()
+            for sid in meta.claude_session_ids:
+                if sid in files_by_id:
+                    ordered.append(files_by_id[sid])
+                else:
+                    ordered.append({"id": sid, "path": "", "mtime": 0.0, "size": 0})
+                seen.add(sid)
+            for sid, info in files_by_id.items():
+                if sid not in seen:
+                    ordered.append(info)
+            ordered.sort(key=lambda x: x.get("mtime", 0.0), reverse=True)
+            live = claude_registry.session_status(project_id, slug)
+            return {
+                "tracked": [sid for sid in meta.claude_session_ids],
+                "sessions": ordered,
+                "tmux_alive": live["tmux_alive"],
+                "tmux_session": live["session"],
+                "tmux_target": meta.tmux_interview_target or "",
+                "claude_cwd": str(cwd),
+            }
+
+        # ===== GET =====
+
         def do_GET(self) -> None:  # noqa: N802
             if not self._require_auth():
                 return
@@ -1215,7 +663,10 @@ def make_handler(
                     st, b, h = _text_bytes("missing index.html", 500)
                     self._send(st, b, h)
                     return
-                st, b, h = _text_bytes(idx.read_text(encoding="utf-8"), content_type="text/html; charset=utf-8")
+                st, b, h = _text_bytes(
+                    idx.read_text(encoding="utf-8"),
+                    content_type="text/html; charset=utf-8",
+                )
                 self._send(st, b, h)
                 return
 
@@ -1225,7 +676,11 @@ def make_handler(
                     st, b, h = _json_bytes({"error": "not found"}, 404)
                     self._send(st, b, h)
                     return
-                mime = _STATIC_MIME.get(sp.suffix) or mimetypes.guess_type(str(sp))[0] or "application/octet-stream"
+                mime = (
+                    _STATIC_MIME.get(sp.suffix)
+                    or mimetypes.guess_type(str(sp))[0]
+                    or "application/octet-stream"
+                )
                 st, b, h = _text_bytes(sp.read_bytes(), content_type=mime)
                 self._send(st, b, h)
                 return
@@ -1268,6 +723,15 @@ def make_handler(
                 self._send(st, b, h)
                 return
 
+            if path == "/api/notes":
+                root, _pid = self._resolve_scope(parsed)
+                if root is None:
+                    self._bad_project()
+                    return
+                st, b, h = _json_bytes({"content": read_project_notes(root)})
+                self._send(st, b, h)
+                return
+
             if path == "/api/tmux/sessions":
                 qs = parse_qs(parsed.query or "")
                 proj = (qs.get("project") or [""])[0].strip()
@@ -1306,7 +770,7 @@ def make_handler(
                 return
 
             if path == "/api/tasks":
-                root, pid = self._resolve_scope(parsed)
+                root, _pid = self._resolve_scope(parsed)
                 if root is None:
                     self._bad_project()
                     return
@@ -1314,13 +778,13 @@ def make_handler(
                 self._send(st, b, h)
                 return
 
-            m_candidates = re.match(r"^/api/tasks/([^/]+)/worktree-candidates$", path)
-            if m_candidates:
-                root, project_id = self._resolve_scope(parsed)
-                if root is None or project_id is None:
+            m_wt_cand = re.match(r"^/api/tasks/([^/]+)/worktree-candidates$", path)
+            if m_wt_cand:
+                root, _pid = self._resolve_scope(parsed)
+                if root is None:
                     self._bad_project()
                     return
-                slug = m_candidates.group(1)
+                slug = m_wt_cand.group(1)
                 if not _SLUG_RE.match(slug):
                     st, b, h = _json_bytes({"error": "invalid slug"}, 400)
                     self._send(st, b, h)
@@ -1330,14 +794,53 @@ def make_handler(
                     st, b, h = _json_bytes({"error": "not found"}, 404)
                     self._send(st, b, h)
                     return
-                candidates = self._worktree_candidates(self._effective_work_dirs_for_task(root, project_id, meta))
-                st, b, h = _json_bytes(candidates)
+                candidates = list_worktree_candidates(root)
+                # Annotate each candidate with the destination path + a
+                # flag the UI uses to disable rows that are already wired
+                # in.  "Already created" means the dest dir is a registered
+                # git worktree (so picking again would be a no-op).
+                dest_parent = task_root(root, slug) / "work"
+                existing_paths = {str(p) for p in list_task_worktrees(root, slug)}
+                for c in candidates:
+                    dest = dest_parent / Path(c["path"]).name
+                    c["destination"] = str(dest)
+                    c["already_created"] = str(dest.resolve()) in existing_paths
+                st, b, h = _json_bytes(
+                    {
+                        "projectRoot": str(root),
+                        "candidates": candidates,
+                        "worktrees": list(meta.worktrees),
+                    }
+                )
+                self._send(st, b, h)
+                return
+
+            m_sessions = re.match(r"^/api/tasks/([^/]+)/claude-sessions$", path)
+            if m_sessions:
+                root, project_id = self._resolve_scope(parsed)
+                if root is None or project_id is None:
+                    self._bad_project()
+                    return
+                slug = m_sessions.group(1)
+                if not _SLUG_RE.match(slug):
+                    st, b, h = _json_bytes({"error": "invalid slug"}, 400)
+                    self._send(st, b, h)
+                    return
+                meta = read_meta(root, slug)
+                if not meta:
+                    st, b, h = _json_bytes({"error": "not found"}, 404)
+                    self._send(st, b, h)
+                    return
+                # Same back-fill so the live Claude info card always sees
+                # the disk truth.
+                meta = detect_and_persist_worktree(root, slug) or meta
+                st, b, h = _json_bytes(self._claude_session_summary(project_id, slug, meta))
                 self._send(st, b, h)
                 return
 
             m = re.match(r"^/api/tasks/([^/]+)$", path)
             if m:
-                root, _pid = self._resolve_scope(parsed)
+                root, project_id = self._resolve_scope(parsed)
                 if root is None:
                     self._bad_project()
                     return
@@ -1351,40 +854,20 @@ def make_handler(
                     st, b, h = _json_bytes({"error": "not found"}, 404)
                     self._send(st, b, h)
                     return
-                templates = {
-                    TASK_PROMPT: read_template(root, slug, TASK_PROMPT) or "",
-                    SUCCESS_CONDITION: read_template(root, slug, SUCCESS_CONDITION) or "",
-                    PLAN: read_template(root, slug, PLAN) or "",
-                }
-                td_get = task_root(root, slug)
+                # Back-fill worktree_path / branch on tasks that pre-date the
+                # auto-worktree feature, or tasks where the user manually
+                # added a worktree under work/ later on.
+                meta = detect_and_persist_worktree(root, slug) or meta
+                templates = {PLAN: read_template(root, slug, PLAN) or ""}
+                summary = self._claude_session_summary(project_id, slug, meta) if project_id else None
+                statuses = list_task_worktree_statuses(root, slug)
                 st, b, h = _json_bytes(
                     {
                         "meta": meta.to_dict(),
                         "templates": templates,
                         "interview": read_interview(root, slug),
-                        "work_repos": list_work_repo_keys(td_get),
-                    }
-                )
-                self._send(st, b, h)
-                return
-
-            m2 = re.match(r"^/api/tasks/([^/]+)/worker/log$", path)
-            if m2:
-                root, project_id = self._resolve_scope(parsed)
-                if root is None or project_id is None:
-                    self._bad_project()
-                    return
-                slug = m2.group(1)
-                qs = parse_qs(parsed.query or "")
-                repo = (qs.get("repo") or [_WORKER_REPO_DEFAULT])[0] or _WORKER_REPO_DEFAULT
-                if not validate_repo_key(repo) or not _SLUG_RE.match(slug):
-                    st, b, h = _json_bytes({"error": "bad request"}, 400)
-                    self._send(st, b, h)
-                    return
-                st, b, h = _json_bytes(
-                    {
-                        "tail": registry.read_log_tail(root, slug, repo),
-                        "status": registry.status(root, project_id, slug, repo),
+                        "claude": summary or {},
+                        "worktree_statuses": statuses,
                     }
                 )
                 self._send(st, b, h)
@@ -1392,6 +875,8 @@ def make_handler(
 
             st, b, h = _json_bytes({"error": "not found"}, 404)
             self._send(st, b, h)
+
+        # ===== POST =====
 
         def do_POST(self) -> None:  # noqa: N802
             if not self._require_auth():
@@ -1436,20 +921,30 @@ def make_handler(
                     cand = Path(str(raw_sp)).expanduser().resolve()
                     if cand.is_file():
                         skills_path = cand
-                raw_ib = str(body.get("interview_backend", interview_backend_default)).lower()
-                task_ib = raw_ib if raw_ib in ("cli", "sdk") else interview_backend_default
-                wd = self._work_dirs_for(root, project_id)
                 meta = create_task(
                     root,
                     title,
                     general_goal,
                     skills_path=skills_path,
                     interview_model=str(body.get("interview_model", "claude-sonnet-4-6")),
-                    interview_backend=task_ib,
-                    work_dirs=wd,
                 )
+                cands = list_worktree_candidates(root)
+                hint = ""
+                if not meta.worktree_path:
+                    if not cands:
+                        hint = (
+                            f" (no git repo at project root {root} or its direct"
+                            " children; nothing to worktree)"
+                        )
+                    else:
+                        hint = (
+                            f" (auto-skip: {len(cands)} candidate(s) "
+                            f"available - pick one via the Claude tab)"
+                        )
                 print(
-                    f"[web] created task slug={meta.slug} dir={task_root(root, meta.slug)}",
+                    f"[web] created task slug={meta.slug} dir={task_root(root, meta.slug)} "
+                    f"worktree={meta.worktree_path or '(none)'} "
+                    f"branch={meta.branch or '(none)'}{hint}",
                     flush=True,
                 )
                 openclaw_client.emit(
@@ -1461,6 +956,8 @@ def make_handler(
                         "title": meta.title,
                         "taskDir": str(task_root(root, meta.slug)),
                         "projectId": project_id,
+                        "worktree": meta.worktree_path or "",
+                        "branch": meta.branch or "",
                     },
                 )
                 st, b, h = _json_bytes({"meta": meta.to_dict()}, 201)
@@ -1566,26 +1063,28 @@ def make_handler(
                 self._send(st, b, h)
                 return
 
-            m_start_interview = re.match(r"^/api/tasks/([^/]+)/interview/start$", path)
-            if m_start_interview:
+            # Claude pane lifecycle - the same two route prefixes were
+            # called /interview/{start,stop} before the rename, accept both.
+            m_start = re.match(r"^/api/tasks/([^/]+)/(?:claude|interview)/start$", path)
+            if m_start:
                 root, project_id = self._resolve_scope(parsed)
                 if root is None or project_id is None:
                     self._bad_project()
                     return
-                slug = m_start_interview.group(1)
+                slug = m_start.group(1)
                 if not _SLUG_RE.match(slug):
                     st, b, h = _json_bytes({"error": "invalid slug"}, 400)
                     self._send(st, b, h)
                     return
-                result = interview_registry.start(root, project_id, slug)
+                result = claude_registry.start(root, project_id, slug)
                 print(
-                    f"[web] start interview slug={slug} ok={bool(result.get('ok'))} "
+                    f"[web] start claude slug={slug} ok={bool(result.get('ok'))} "
                     f"session={result.get('session', '')} target={result.get('target', '')}",
                     flush=True,
                 )
                 openclaw_client.emit(
-                    "interview-start",
-                    instruction=f"claudeloop deep-interview started for task {slug}",
+                    "claude-start",
+                    instruction=f"claudeloop Claude pane started for task {slug}",
                     project_root=root,
                     task_slug=slug,
                     data=result,
@@ -1598,13 +1097,13 @@ def make_handler(
                 self._send(st, b, h)
                 return
 
-            m_stop_interview = re.match(r"^/api/tasks/([^/]+)/interview/stop$", path)
-            if m_stop_interview:
+            m_stop = re.match(r"^/api/tasks/([^/]+)/(?:claude|interview)/stop$", path)
+            if m_stop:
                 root, project_id = self._resolve_scope(parsed)
                 if root is None or project_id is None:
                     self._bad_project()
                     return
-                slug = m_stop_interview.group(1)
+                slug = m_stop.group(1)
                 if not _SLUG_RE.match(slug):
                     st, b, h = _json_bytes({"error": "invalid slug"}, 400)
                     self._send(st, b, h)
@@ -1613,10 +1112,10 @@ def make_handler(
                     st, b, h = _json_bytes({"error": "not found"}, 404)
                     self._send(st, b, h)
                     return
-                result = interview_registry.stop(root, project_id, slug)
+                result = claude_registry.stop(root, project_id, slug)
                 openclaw_client.emit(
-                    "interview-stop",
-                    instruction=f"claudeloop deep-interview stopped for task {slug}",
+                    "claude-stop",
+                    instruction=f"claudeloop Claude pane stopped for task {slug}",
                     project_root=root,
                     task_slug=slug,
                     data=result,
@@ -1625,47 +1124,13 @@ def make_handler(
                 self._send(st, b, h)
                 return
 
-            m_start_ask = re.match(r"^/api/tasks/([^/]+)/ask/start$", path)
-            if m_start_ask:
+            m_wt_create = re.match(r"^/api/tasks/([^/]+)/worktree$", path)
+            if m_wt_create:
                 root, project_id = self._resolve_scope(parsed)
                 if root is None or project_id is None:
                     self._bad_project()
                     return
-                slug = m_start_ask.group(1)
-                if not _SLUG_RE.match(slug):
-                    st, b, h = _json_bytes({"error": "invalid slug"}, 400)
-                    self._send(st, b, h)
-                    return
-                repo = str(body.get("repo", "")).strip()
-                result = ask_registry.start(root, project_id, slug, repo=repo)
-                print(
-                    f"[web] start ask slug={slug} repo={repo} ok={bool(result.get('ok'))} "
-                    f"session={result.get('session', '')} target={result.get('target', '')}",
-                    flush=True,
-                )
-                openclaw_client.emit(
-                    "ask-start",
-                    instruction=f"claudeloop ask pane started for task {slug}",
-                    project_root=root,
-                    task_slug=slug,
-                    repo=repo or None,
-                    data=result,
-                )
-                st, b, h = (
-                    _json_bytes(result)
-                    if result.get("ok")
-                    else _json_bytes(result, 400)
-                )
-                self._send(st, b, h)
-                return
-
-            m_stop_ask = re.match(r"^/api/tasks/([^/]+)/ask/stop$", path)
-            if m_stop_ask:
-                root, project_id = self._resolve_scope(parsed)
-                if root is None or project_id is None:
-                    self._bad_project()
-                    return
-                slug = m_stop_ask.group(1)
+                slug = m_wt_create.group(1)
                 if not _SLUG_RE.match(slug):
                     st, b, h = _json_bytes({"error": "invalid slug"}, 400)
                     self._send(st, b, h)
@@ -1674,215 +1139,199 @@ def make_handler(
                     st, b, h = _json_bytes({"error": "not found"}, 404)
                     self._send(st, b, h)
                     return
-                result = ask_registry.stop(root, project_id, slug)
-                openclaw_client.emit(
-                    "ask-stop",
-                    instruction=f"claudeloop ask pane stopped for task {slug}",
-                    project_root=root,
-                    task_slug=slug,
-                    data=result,
-                )
-                st, b, h = _json_bytes(result)
-                self._send(st, b, h)
-                return
-
-            m2 = re.match(r"^/api/tasks/([^/]+)/worktrees$", path)
-            if m2:
-                root, project_id = self._resolve_scope(parsed)
-                if root is None or project_id is None:
-                    self._bad_project()
-                    return
-                slug = m2.group(1)
-                meta = read_meta(root, slug)
-                if not meta:
-                    st, b, h = _json_bytes({"error": "not found"}, 404)
+                raw_src = str(body.get("source_repo", "")).strip()
+                if not raw_src:
+                    st, b, h = _json_bytes({"error": "source_repo required"}, 400)
                     self._send(st, b, h)
                     return
-                if not meta.work_dirs:
-                    source_dirs = self._work_dirs_for(root, project_id)
-                    meta = update_meta(root, slug, work_dirs=[str(p) for p in source_dirs])
-                    if not meta:
-                        st, b, h = _json_bytes({"error": "not found"}, 404)
-                        self._send(st, b, h)
-                        return
-                selected_work_dirs: list[Path] | None = None
-                raw_work_dirs = body.get("work_dirs")
-                if raw_work_dirs is not None:
-                    if not isinstance(raw_work_dirs, list):
-                        st, b, h = _json_bytes({"error": "work_dirs must be a list"}, 400)
-                        self._send(st, b, h)
-                        return
-                    candidates = self._worktree_candidates(self._effective_work_dirs_for_task(root, project_id, meta))
-                    allowed = {
-                        str(Path(str(repo.get("path", ""))).expanduser().resolve())
-                        for group in candidates.get("groups", [])
-                        for repo in (group.get("repos") or [])
-                        if str(repo.get("path", "")).strip()
-                    }
-                    selected_work_dirs = []
-                    for item in raw_work_dirs:
-                        try:
-                            candidate = Path(str(item)).expanduser().resolve()
-                        except OSError:
-                            st, b, h = _json_bytes({"error": f"invalid work_dir: {item}"}, 400)
-                            self._send(st, b, h)
-                            return
-                        if str(candidate) not in allowed:
-                            st, b, h = _json_bytes({"error": f"work_dir is not an allowed candidate: {candidate}"}, 400)
-                            self._send(st, b, h)
-                            return
-                        if candidate not in selected_work_dirs:
-                            selected_work_dirs.append(candidate)
-                    if not selected_work_dirs:
-                        st, b, h = _json_bytes({"error": "select at least one work_dir"}, 400)
-                        self._send(st, b, h)
-                        return
-                results = (
-                    prepare_selected_worktrees(root, slug, selected_work_dirs)
-                    if selected_work_dirs is not None
-                    else prepare_all_worktrees(root, slug)
-                )
-                print(
-                    f"[web] create worktree slug={slug} "
-                    f"ok={sum(1 for r in results if r.get('ok'))}/{len(results)}",
-                    flush=True,
-                )
-                for row in results:
-                    if row.get("ok"):
-                        continue
-                    print(
-                        "[web] create worktree failed "
-                        f"slug={slug} repo={row.get('repo_key') or row.get('work_dir') or '?'} "
-                        f"reason={row.get('reason') or 'unknown'}",
-                        flush=True,
+                # Whitelist against the project's candidate list so a
+                # poisoned request can't make us run `git worktree add`
+                # against an arbitrary path on disk.
+                allowed = {
+                    str(Path(c["path"]).resolve())
+                    for c in list_worktree_candidates(root)
+                }
+                try:
+                    src_resolved = str(Path(raw_src).expanduser().resolve())
+                except OSError as exc:
+                    st, b, h = _json_bytes({"error": f"invalid path: {exc}"}, 400)
+                    self._send(st, b, h)
+                    return
+                if src_resolved not in allowed:
+                    st, b, h = _json_bytes(
+                        {
+                            "error": "source_repo is not in the project's candidate list",
+                            "allowed": sorted(allowed),
+                        },
+                        400,
                     )
+                    self._send(st, b, h)
+                    return
+                wt, branch, msg = prepare_task_worktree_from(
+                    root, slug, Path(src_resolved)
+                )
+                print(
+                    f"[web] manual worktree slug={slug} src={src_resolved} "
+                    f"ok={wt is not None} msg={msg}",
+                    flush=True,
+                )
+                if wt is None:
+                    st, b, h = _json_bytes(
+                        {"ok": False, "error": msg, "branch": branch}, 400
+                    )
+                    self._send(st, b, h)
+                    return
+                # Append (or refresh) the worktree list from disk.  Don't
+                # call update_meta directly so order / branches stay in
+                # sync across the existing entries.
+                updated = detect_and_persist_worktree(root, slug) or read_meta(root, slug)
                 openclaw_client.emit(
                     "worktree-created",
                     instruction=f"claudeloop worktree created for task {slug}",
                     project_root=root,
                     task_slug=slug,
-                    data={"results": results},
+                    data={"source_repo": src_resolved, "worktree": str(wt), "branch": branch},
                 )
-                st, b, h = _json_bytes({"results": results})
+                st, b, h = _json_bytes(
+                    {
+                        "ok": True,
+                        "worktree_path": str(wt),
+                        "branch": branch,
+                        "message": msg,
+                        "meta": updated.to_dict() if updated else None,
+                    }
+                )
                 self._send(st, b, h)
                 return
 
-            m3 = re.match(r"^/api/tasks/([^/]+)/worker/start$", path)
-            if m3:
+            m_wt_push = re.match(r"^/api/tasks/([^/]+)/worktree/push$", path)
+            if m_wt_push:
                 root, project_id = self._resolve_scope(parsed)
                 if root is None or project_id is None:
                     self._bad_project()
                     return
-                slug = m3.group(1)
-                if not read_meta(root, slug):
+                slug = m_wt_push.group(1)
+                if not _SLUG_RE.match(slug):
+                    st, b, h = _json_bytes({"error": "invalid slug"}, 400)
+                    self._send(st, b, h)
+                    return
+                meta = read_meta(root, slug)
+                if not meta:
                     st, b, h = _json_bytes({"error": "not found"}, 404)
                     self._send(st, b, h)
                     return
-                repo = str(body.get("repo", _WORKER_REPO_DEFAULT)).strip() or _WORKER_REPO_DEFAULT
-                if not validate_repo_key(repo):
-                    st, b, h = _json_bytes({"error": "invalid repo key"}, 400)
+                raw_path = str(body.get("path", "")).strip()
+                if not raw_path:
+                    st, b, h = _json_bytes({"error": "path required"}, 400)
                     self._send(st, b, h)
                     return
-                mode = "tmux"
-                ok, msg = registry.start(
-                    root,
-                    project_id,
-                    slug,
-                    repo,
-                    mode=mode,
-                    max_iters=int(body.get("max_iters", 200) or 200),
-                    model=str(body.get("model", "claude-opus-4-6")),
-                )
+                try:
+                    wt = Path(raw_path).expanduser().resolve()
+                except OSError as exc:
+                    st, b, h = _json_bytes({"error": f"invalid path: {exc}"}, 400)
+                    self._send(st, b, h)
+                    return
+                if str(wt) not in meta.worktrees:
+                    st, b, h = _json_bytes(
+                        {"error": "worktree is not registered with this task"},
+                        400,
+                    )
+                    self._send(st, b, h)
+                    return
+                result = push_worktree_branch(wt)
+                # Refresh status snapshot so the UI can update ahead/behind.
+                result["status"] = worktree_status(wt)
                 print(
-                    f"[web] start worker slug={slug} repo={repo} ok={ok} detail={msg}",
+                    f"[web] push worktree slug={slug} path={wt} "
+                    f"ok={result.get('ok')} branch={result.get('branch')}",
                     flush=True,
-                )
-                openclaw_client.emit(
-                    "worker-start",
-                    instruction=f"claudeloop worker started for task {slug} repo {repo}",
-                    project_root=root,
-                    task_slug=slug,
-                    repo=repo,
-                    data={"ok": ok, "detail": msg},
-                )
-                st, b, h = (
-                    _json_bytes({"ok": True, "log_path": msg})
-                    if ok
-                    else _json_bytes({"ok": False, "error": msg}, 400)
-                )
-                self._send(st, b, h)
-                return
-
-            m4 = re.match(r"^/api/tasks/([^/]+)/worker/stop$", path)
-            if m4:
-                root, project_id = self._resolve_scope(parsed)
-                if root is None or project_id is None:
-                    self._bad_project()
-                    return
-                slug = m4.group(1)
-                if not read_meta(root, slug):
-                    st, b, h = _json_bytes({"error": "not found"}, 404)
-                    self._send(st, b, h)
-                    return
-                repo = str(body.get("repo", _WORKER_REPO_DEFAULT)).strip() or _WORKER_REPO_DEFAULT
-                if not validate_repo_key(repo):
-                    st, b, h = _json_bytes({"error": "invalid repo key"}, 400)
-                    self._send(st, b, h)
-                    return
-                result = registry.stop(root, project_id, slug, repo)
-                print(f"[web] stop worker slug={slug} repo={repo}", flush=True)
-                openclaw_client.emit(
-                    "worker-stop",
-                    instruction=f"claudeloop worker stopped for task {slug} repo {repo}",
-                    project_root=root,
-                    task_slug=slug,
-                    repo=repo,
-                    data=result,
-                )
-                st, b, h = _json_bytes(result)
-                self._send(st, b, h)
-                return
-
-            m_push = re.match(r"^/api/tasks/([^/]+)/worker/push$", path)
-            if m_push:
-                root, project_id = self._resolve_scope(parsed)
-                if root is None or project_id is None:
-                    self._bad_project()
-                    return
-                slug = m_push.group(1)
-                if not read_meta(root, slug):
-                    st, b, h = _json_bytes({"ok": False, "error": "not found"}, 404)
-                    self._send(st, b, h)
-                    return
-                repo = str(body.get("repo", "")).strip()
-                if repo:
-                    if not validate_repo_key(repo) or repo == _WORKER_REPO_DEFAULT:
-                        st, b, h = _json_bytes({"ok": False, "error": "invalid repo key"}, 400)
-                        self._send(st, b, h)
-                        return
-                    result = _push_worktree_branch(root, slug, repo, project_id)
-                    result["repo"] = repo
-                else:
-                    result = _push_all_worktree_branches(root, slug, project_id)
-                print(
-                    f"[web] push branch slug={slug} repo={repo or '*'} ok={result.get('ok')} "
-                    f"branch={result.get('branch', '')} count={result.get('count', '')}",
-                    flush=True,
-                )
-                openclaw_client.emit(
-                    "worker-push",
-                    instruction=f"claudeloop pushed task {slug} worktree branches",
-                    project_root=root,
-                    task_slug=slug,
-                    repo=repo or None,
-                    data=result,
                 )
                 st, b, h = _json_bytes(result, 200 if result.get("ok") else 400)
                 self._send(st, b, h)
                 return
 
+            m_wt_push_all = re.match(r"^/api/tasks/([^/]+)/worktrees/push-all$", path)
+            if m_wt_push_all:
+                root, project_id = self._resolve_scope(parsed)
+                if root is None or project_id is None:
+                    self._bad_project()
+                    return
+                slug = m_wt_push_all.group(1)
+                if not _SLUG_RE.match(slug):
+                    st, b, h = _json_bytes({"error": "invalid slug"}, 400)
+                    self._send(st, b, h)
+                    return
+                meta = read_meta(root, slug)
+                if not meta:
+                    st, b, h = _json_bytes({"error": "not found"}, 404)
+                    self._send(st, b, h)
+                    return
+                results: list[dict[str, Any]] = []
+                for p_str in meta.worktrees:
+                    wt = Path(p_str)
+                    row = push_worktree_branch(wt)
+                    row["path"] = p_str
+                    row["status"] = worktree_status(wt)
+                    results.append(row)
+                ok_all = bool(results) and all(r.get("ok") for r in results)
+                print(
+                    f"[web] push-all slug={slug} ok={sum(1 for r in results if r.get('ok'))}/{len(results)}",
+                    flush=True,
+                )
+                openclaw_client.emit(
+                    "worktrees-pushed",
+                    instruction=f"claudeloop pushed worktree branches for task {slug}",
+                    project_root=root,
+                    task_slug=slug,
+                    data={"results": results},
+                )
+                st, b, h = _json_bytes(
+                    {"ok": ok_all, "count": len(results), "results": results}
+                )
+                self._send(st, b, h)
+                return
+
+            m_resume = re.match(r"^/api/tasks/([^/]+)/claude/resume$", path)
+            if m_resume:
+                root, project_id = self._resolve_scope(parsed)
+                if root is None or project_id is None:
+                    self._bad_project()
+                    return
+                slug = m_resume.group(1)
+                if not _SLUG_RE.match(slug):
+                    st, b, h = _json_bytes({"error": "invalid slug"}, 400)
+                    self._send(st, b, h)
+                    return
+                sid = str(body.get("session_id", "")).strip()
+                if not _SESSION_ID_RE.match(sid):
+                    st, b, h = _json_bytes({"error": "invalid session_id"}, 400)
+                    self._send(st, b, h)
+                    return
+                result = claude_registry.start(root, project_id, slug, resume_session_id=sid)
+                print(
+                    f"[web] resume claude slug={slug} session={sid} ok={bool(result.get('ok'))} "
+                    f"target={result.get('target', '')}",
+                    flush=True,
+                )
+                openclaw_client.emit(
+                    "claude-resume",
+                    instruction=f"claudeloop Claude pane resumed for task {slug}",
+                    project_root=root,
+                    task_slug=slug,
+                    data={**result, "session_id": sid},
+                )
+                st, b, h = (
+                    _json_bytes(result)
+                    if result.get("ok")
+                    else _json_bytes(result, 400)
+                )
+                self._send(st, b, h)
+                return
+
             st, b, h = _json_bytes({"error": "not found"}, 404)
             self._send(st, b, h)
+
+        # ===== PUT =====
 
         def do_PUT(self) -> None:  # noqa: N802
             if not self._require_auth():
@@ -1891,30 +1340,50 @@ def make_handler(
             path = parsed.path
             body = _read_json(self)
 
-            m0 = re.match(r"^/api/tasks/([^/]+)/tmux$", path)
-            if m0:
+            if path == "/api/notes":
                 root, _pid = self._resolve_scope(parsed)
                 if root is None:
                     self._bad_project()
                     return
-                slug = m0.group(1)
+                content = body.get("content", "")
+                if not isinstance(content, str):
+                    st, b, h = _json_bytes({"error": "content must be string"}, 400)
+                    self._send(st, b, h)
+                    return
+                if not write_project_notes(root, content):
+                    st, b, h = _json_bytes({"error": "failed to write NOTES.md"}, 500)
+                    self._send(st, b, h)
+                    return
+                st, b, h = _json_bytes({"ok": True})
+                self._send(st, b, h)
+                return
+
+            m_meta = re.match(r"^/api/tasks/([^/]+)/meta$", path)
+            if m_meta:
+                root, _pid = self._resolve_scope(parsed)
+                if root is None:
+                    self._bad_project()
+                    return
+                slug = m_meta.group(1)
                 if not _SLUG_RE.match(slug):
                     st, b, h = _json_bytes({"error": "invalid slug"}, 400)
                     self._send(st, b, h)
                     return
-                r_t = str(body.get("tmux_runner_target", "")).strip()
-                e_t = str(body.get("tmux_evaluator_target", "")).strip()
-                if not validate_tmux_target(r_t) or not validate_tmux_target(e_t):
-                    st, b, h = _json_bytes({"error": "invalid pane target"}, 400)
+                title = body.get("title")
+                goal = body.get("general_goal")
+                if title is None and goal is None:
+                    st, b, h = _json_bytes(
+                        {"error": "supply title and/or general_goal"}, 400
+                    )
                     self._send(st, b, h)
                     return
-                updated = update_meta(
+                updated = rename_task_meta(
                     root,
                     slug,
-                    tmux_runner_target=r_t,
-                    tmux_evaluator_target=e_t,
+                    title=str(title) if title is not None else None,
+                    general_goal=str(goal) if goal is not None else None,
                 )
-                if not updated:
+                if updated is None:
                     st, b, h = _json_bytes({"error": "not found"}, 404)
                     self._send(st, b, h)
                     return
@@ -1949,11 +1418,69 @@ def make_handler(
             st, b, h = _json_bytes({"ok": True})
             self._send(st, b, h)
 
+        # ===== DELETE =====
+
         def do_DELETE(self) -> None:  # noqa: N802
             if not self._require_auth():
                 return
             parsed = urlparse(self.path)
             path = parsed.path
+
+            m_wt_del = re.match(r"^/api/tasks/([^/]+)/worktree$", path)
+            if m_wt_del:
+                root, project_id = self._resolve_scope(parsed)
+                if root is None or project_id is None:
+                    self._bad_project()
+                    return
+                slug = m_wt_del.group(1)
+                if not _SLUG_RE.match(slug):
+                    st, b, h = _json_bytes({"error": "invalid slug"}, 400)
+                    self._send(st, b, h)
+                    return
+                meta = read_meta(root, slug)
+                if not meta:
+                    st, b, h = _json_bytes({"error": "not found"}, 404)
+                    self._send(st, b, h)
+                    return
+                qs = parse_qs(parsed.query or "")
+                raw_path = (qs.get("path") or [""])[0].strip()
+                if not raw_path:
+                    st, b, h = _json_bytes({"error": "path query param required"}, 400)
+                    self._send(st, b, h)
+                    return
+                try:
+                    wt_target = Path(raw_path).expanduser().resolve()
+                except OSError as exc:
+                    st, b, h = _json_bytes({"error": f"invalid path: {exc}"}, 400)
+                    self._send(st, b, h)
+                    return
+                ok_rm, msg_rm = remove_task_worktree(root, slug, wt_target)
+                print(
+                    f"[web] remove worktree slug={slug} path={wt_target} "
+                    f"ok={ok_rm} msg={msg_rm}",
+                    flush=True,
+                )
+                if not ok_rm:
+                    st, b, h = _json_bytes({"ok": False, "error": msg_rm}, 400)
+                    self._send(st, b, h)
+                    return
+                openclaw_client.emit(
+                    "worktree-removed",
+                    instruction=f"claudeloop worktree removed for task {slug}",
+                    project_root=root,
+                    task_slug=slug,
+                    data={"worktree": str(wt_target)},
+                )
+                updated = read_meta(root, slug)
+                st, b, h = _json_bytes(
+                    {
+                        "ok": True,
+                        "message": msg_rm,
+                        "meta": updated.to_dict() if updated else None,
+                    }
+                )
+                self._send(st, b, h)
+                return
 
             m_task_del = re.match(r"^/api/tasks/([^/]+)$", path)
             if m_task_del:
@@ -1995,13 +1522,14 @@ def make_handler(
     return Handler
 
 
+# --- Bootstrap --------------------------------------------------------------
+
+
 def serve(
     host: str,
     port: int,
     project_root: Path,
     default_skills: Path,
-    default_work_dirs: list[Path],
-    interview_backend_default: str = "cli",
     openclaw_config: OpenClawConfig | None = None,
     auth_token: str = "",
     *,
@@ -2012,28 +1540,20 @@ def serve(
     web_project_registry = WebProjectRegistry()
     if multi_project_workspace:
         web_project_registry.prune_redundant_parent_projects(project_root)
-    registry = RunRegistry()
-    interview_registry = InterviewRegistry()
-    ask_registry = AskRegistry()
+    claude_registry = ClaudeRegistry()
     openclaw_client = OpenClawClient(openclaw_config)
-    ib = interview_backend_default if interview_backend_default in ("cli", "sdk") else "cli"
     sk = default_skills if default_skills.is_file() else bundled_skills_path().resolve()
     handler = make_handler(
         web_project_registry,
         project_root,
         sk,
-        default_work_dirs,
-        registry,
-        interview_registry,
-        ask_registry,
-        ib,
+        claude_registry,
         openclaw_client,
         auth_token,
         multi_project_workspace=multi_project_workspace,
     )
     server = HTTPServer((host, port), handler)
     rud_root = project_root / ".RUD"
-    work_sources = ", ".join(str(p) for p in default_work_dirs) if default_work_dirs else str(project_root)
     print("", flush=True)
     print("claudeloop web", flush=True)
     print(f"  URL:              http://{host}:{port}/", flush=True)
@@ -2044,15 +1564,12 @@ def serve(
     )
     print(f"  Project registry: {web_project_registry.persist_path}", flush=True)
     print(f"  Task root:        {rud_root}", flush=True)
+    print(f"  Project notes:    {rud_root}/NOTES.md", flush=True)
     print(f"  Static assets:    {web_static_dir().resolve()}", flush=True)
     print(f"  Default skills:   {sk}", flush=True)
-    print(f"  Interview:        {ib} backend, Claude Code tmux pane on demand", flush=True)
-    print(f"  Worktree source:  {work_sources}", flush=True)
-    print("  Worker mode:      claudeloop tmux, effort=max, no auto-commit", flush=True)
+    print("  Tabs:             Claude, PLAN.md (per task) + Notes button (per project)", flush=True)
     print(f"  Auth:             {'enabled' if auth_token.strip() else 'disabled'}", flush=True)
     print(f"  OpenClaw:         {openclaw_status(openclaw_client.config)}", flush=True)
-    print("  Stop behavior:    stops controller process and kills the task tmux session", flush=True)
-    print("  Logs:             this terminal; worker logs under .RUD/<task>/runs/<repo>/worker.log", flush=True)
     print("", flush=True)
     openclaw_client.emit(
         "web-start",

@@ -1,4 +1,4 @@
-"""Tests for `.RUD` task storage and worktrees."""
+"""Tests for the slim `.RUD` task storage layer."""
 
 from __future__ import annotations
 
@@ -8,18 +8,21 @@ from pathlib import Path
 import claudeloop.rud_task as rud_task
 from claudeloop.rud_task import (
     PLAN,
-    SUCCESS_CONDITION,
-    TASK_PROMPT,
+    add_claude_session,
+    claude_project_dir,
     create_task,
     delete_task,
-    list_work_repo_keys,
+    list_session_files,
     path_under_task,
-    prepare_worktree,
+    project_notes_path,
     read_meta,
+    read_project_notes,
     read_template,
-    repo_name_for_work_dir,
+    session_id_from_path,
     slugify,
     task_root,
+    task_worktree_path,
+    write_project_notes,
     write_template,
 )
 
@@ -32,104 +35,90 @@ def test_slugify() -> None:
 def test_path_under_task(tmp_path: Path) -> None:
     td = tmp_path / "t"
     td.mkdir()
-    assert path_under_task(td, "TASK_PROMPT.md") == td / "TASK_PROMPT.md"
+    assert path_under_task(td, "PLAN.md") == td / "PLAN.md"
     assert path_under_task(td, "../etc/passwd") is None
 
 
-def test_create_task_and_templates(tmp_path: Path) -> None:
+def test_create_task_seeds_plan_only(tmp_path: Path) -> None:
     skills = tmp_path / "skills.md"
     skills.write_text("# skills", encoding="utf-8")
     meta = create_task(
         tmp_path,
         "My Task",
-        "这是我们一个general goal：build X",
+        "build the thing",
         skills_path=skills,
-        work_dirs=None,
+        auto_worktree=False,
     )
     assert meta.slug.startswith("my-task")
-    assert (tmp_path / ".RUD" / meta.slug / TASK_PROMPT).is_file()
     root = task_root(tmp_path, meta.slug)
-    assert (root / SUCCESS_CONDITION).is_file()
     assert (root / PLAN).is_file()
+    # NOTES.md is no longer per-task.
+    assert not (root / "NOTES.md").exists()
     m2 = read_meta(tmp_path, meta.slug)
     assert m2 is not None
     assert m2.skills_path == str(skills.resolve())
-    assert write_template(tmp_path, meta.slug, TASK_PROMPT, "hello")
-    assert read_template(tmp_path, meta.slug, TASK_PROMPT) == "hello"
+    assert m2.claude_session_ids == []
 
 
-def _git_init_repo(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test.local"],
-        cwd=path,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "test"],
-        cwd=path,
-        check=True,
-        capture_output=True,
-    )
-    (path / "README.md").write_text("# hi\n", encoding="utf-8")
-    subprocess.run(["git", "add", "-A"], cwd=path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init", "--no-gpg-sign"],
-        cwd=path,
-        check=True,
-        capture_output=True,
-    )
+def test_write_and_read_plan_template(tmp_path: Path) -> None:
+    meta = create_task(tmp_path, "edit me", "goal", skills_path=None, auto_worktree=False)
+    assert write_template(tmp_path, meta.slug, PLAN, "hello plan")
+    assert read_template(tmp_path, meta.slug, PLAN) == "hello plan"
 
 
-def test_prepare_worktree(tmp_path: Path) -> None:
-    repo = tmp_path / "githubA"
-    _git_init_repo(repo)
-    task_dir = tmp_path / ".RUD" / "slug1"
-    task_dir.mkdir(parents=True)
-    (task_dir / "work").mkdir(parents=True, exist_ok=True)
-    ok, reason, wt = prepare_worktree(task_dir, repo, "slug1")
-    assert ok, reason
-    assert wt is not None
-    assert wt == task_dir / "work" / "githubA"
-    assert repo_name_for_work_dir(repo) == "githubA"
-    ok2, reason2, wt2 = prepare_worktree(task_dir, repo, "slug1")
-    assert ok2 and wt2 == wt and reason2 == "existing"
-
-
-def test_auto_nested_worktrees_on_create(tmp_path: Path) -> None:
-    g1 = tmp_path / "G1"
-    _git_init_repo(g1)
-    g2 = g1 / "G2"
-    _git_init_repo(g2)
-    meta = create_task(
-        tmp_path,
-        "xorl1",
-        "这是我们一个general goal：nested",
-        skills_path=None,
-        work_dirs=[g1],
-    )
-    assert meta.slug == "xorl1"
-    root = task_root(tmp_path, meta.slug)
-    assert (root / "work" / "G1").is_dir()
-    assert (root / "work" / "G1" / "G2").is_dir()
-    keys = list_work_repo_keys(root)
-    assert "G1" in keys
-    assert "G1/G2" in keys
-
-
-def test_write_template_rejects_bad_name(tmp_path: Path) -> None:
-    meta = create_task(tmp_path, "t", "goal", skills_path=None, work_dirs=None, auto_worktrees=False)
+def test_write_template_rejects_disallowed_names(tmp_path: Path) -> None:
+    meta = create_task(tmp_path, "t", "goal", skills_path=None, auto_worktree=False)
+    # PLAN.md is the only allowed per-task template now.  NOTES.md moved
+    # to the project root and TASK_PROMPT.md / SUCCESS_CONDITION.md are gone.
+    assert write_template(tmp_path, meta.slug, "NOTES.md", "x") is False
+    assert write_template(tmp_path, meta.slug, "TASK_PROMPT.md", "x") is False
     assert write_template(tmp_path, meta.slug, "evil.md", "x") is False
 
 
+def test_project_notes_round_trip(tmp_path: Path) -> None:
+    # Reads return empty string when the file doesn't exist yet.
+    assert read_project_notes(tmp_path) == ""
+    # Write places the file at <project>/.RUD/NOTES.md and not inside a task.
+    assert write_project_notes(tmp_path, "future ideas")
+    assert project_notes_path(tmp_path) == tmp_path / ".RUD" / "NOTES.md"
+    assert read_project_notes(tmp_path) == "future ideas"
+    # Creating a task afterwards must not stomp the project notes.
+    create_task(tmp_path, "t", "goal", skills_path=None, auto_worktree=False)
+    assert read_project_notes(tmp_path) == "future ideas"
+
+
+def test_add_claude_session_dedup_and_order(tmp_path: Path) -> None:
+    meta = create_task(tmp_path, "sess", "goal", skills_path=None, auto_worktree=False)
+    add_claude_session(tmp_path, meta.slug, "uuid-A")
+    add_claude_session(tmp_path, meta.slug, "uuid-B")
+    add_claude_session(tmp_path, meta.slug, "uuid-A")  # already there - move to end
+    m = read_meta(tmp_path, meta.slug)
+    assert m is not None
+    assert m.claude_session_ids == ["uuid-B", "uuid-A"]
+
+
+def test_meta_ignores_legacy_fields(tmp_path: Path) -> None:
+    """Older task.json files have extra fields - reading them must not crash."""
+    meta = create_task(tmp_path, "legacy", "goal", skills_path=None, auto_worktree=False)
+    meta_path = task_root(tmp_path, meta.slug) / "task.json"
+    raw = meta_path.read_text(encoding="utf-8").rstrip().rstrip("}")
+    raw += (
+        ', "work_dirs": ["/old"], "tmux_runner_target": "x:0.0",'
+        ' "tmux_ask_target": "y:0.0", "interview_backend": "cli"}'
+    )
+    meta_path.write_text(raw, encoding="utf-8")
+    reloaded = read_meta(tmp_path, meta.slug)
+    assert reloaded is not None
+    assert reloaded.slug == meta.slug
+    assert reloaded.title == "legacy"
+
+
 def test_delete_task_falls_back_to_sudo(monkeypatch, tmp_path: Path) -> None:
-    meta = create_task(tmp_path, "sudo delete", "goal", skills_path=None, work_dirs=None, auto_worktrees=False)
+    meta = create_task(tmp_path, "sudo delete", "goal", skills_path=None, auto_worktree=False)
     calls: list[list[str]] = []
 
     def fake_rmtree(path: Path) -> None:
-        raise PermissionError(13, "Permission denied", str(path / "work" / "__pycache__"))
+        raise PermissionError(13, "Permission denied", str(path / "__pycache__"))
 
     def fake_run(args, **kwargs):
         calls.append(list(args))
@@ -141,4 +130,341 @@ def test_delete_task_falls_back_to_sudo(monkeypatch, tmp_path: Path) -> None:
     ok, err = delete_task(tmp_path, meta.slug)
 
     assert ok, err
-    assert calls == [["sudo", "-n", "rm", "-rf", "--", str(task_root(tmp_path, meta.slug))]]
+    # First call may be `git worktree remove --force` (fails silently if no
+    # worktree was created) and the second call is the sudo rmtree.
+    assert any(c == ["sudo", "-n", "rm", "-rf", "--", str(task_root(tmp_path, meta.slug))] for c in calls)
+
+
+# --- session lookup helpers -------------------------------------------------
+
+
+def test_claude_project_dir_encodes_path() -> None:
+    path = Path("/home/u/proj/.RUD/foo/work/r")
+    expected_suffix = "-home-u-proj--RUD-foo-work-r"
+    assert claude_project_dir(path).name == expected_suffix
+
+
+def test_list_session_files_returns_jsonl_sorted(tmp_path: Path, monkeypatch) -> None:
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(rud_task.Path, "home", classmethod(lambda cls: fake_home))
+    cwd = tmp_path / "a" / "b"
+    cwd.mkdir(parents=True)
+    enc = claude_project_dir(cwd)
+    enc.mkdir(parents=True)
+    older = enc / "aaaa-bbbb.jsonl"
+    newer = enc / "cccc-dddd.jsonl"
+    older.write_text("{}\n", encoding="utf-8")
+    newer.write_text("{}\n", encoding="utf-8")
+    import os
+    os.utime(older, (1000, 1000))
+    os.utime(newer, (2000, 2000))
+    enc.joinpath("ignored.txt").write_text("nope", encoding="utf-8")
+    files = list_session_files(cwd)
+    assert [p.name for p in files] == ["aaaa-bbbb.jsonl", "cccc-dddd.jsonl"]
+    assert session_id_from_path(files[-1]) == "cccc-dddd"
+
+
+# --- worktree helpers (real git) --------------------------------------------
+
+
+def _git_init_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    env = {
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@test.local",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@test.local",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, env={**env, "PATH": "/usr/bin:/bin"})
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=path, check=True)
+    (path / "README.md").write_text("# hi\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True, env={**env, "PATH": "/usr/bin:/bin"})
+    subprocess.run(
+        ["git", "commit", "-m", "init", "--no-gpg-sign", "-q"],
+        cwd=path,
+        check=True,
+        env={**env, "PATH": "/usr/bin:/bin"},
+    )
+
+
+def test_create_task_auto_creates_worktree(tmp_path: Path) -> None:
+    repo = tmp_path / "myrepo"
+    _git_init_repo(repo)
+    meta = create_task(repo, "wt task", "goal", skills_path=None)
+    wt = task_worktree_path(repo, meta.slug)
+    assert wt is not None
+    assert wt == task_root(repo, meta.slug) / "work" / "myrepo"
+    assert (wt / "README.md").is_file()
+    # Branch follows the zhongzhu/<slug> convention.
+    reloaded = read_meta(repo, meta.slug)
+    assert reloaded is not None
+    assert reloaded.branch == f"zhongzhu/{meta.slug}"
+    assert reloaded.worktree_path == str(wt)
+
+
+def test_create_task_skips_worktree_in_non_git_root(tmp_path: Path) -> None:
+    meta = create_task(tmp_path, "no-git", "goal", skills_path=None)
+    assert task_worktree_path(tmp_path, meta.slug) is None
+    reloaded = read_meta(tmp_path, meta.slug)
+    assert reloaded is not None
+    assert reloaded.worktree_path == ""
+    assert reloaded.branch == ""
+
+
+def test_detect_worktree_backfills_old_meta(tmp_path: Path) -> None:
+    """Tasks created before auto-worktree existed should pick up the worktree
+    on next read."""
+    from claudeloop.rud_task import detect_and_persist_worktree
+
+    repo = tmp_path / "myrepo"
+    _git_init_repo(repo)
+
+    # Step 1: create a task with auto_worktree disabled, simulating a task
+    # whose task.json was written before today's changes.
+    meta = create_task(repo, "old style", "goal", skills_path=None, auto_worktree=False)
+    assert read_meta(repo, meta.slug).worktree_path == ""
+
+    # Step 2: user manually adds a worktree the way they used to.
+    td = task_root(repo, meta.slug)
+    wt_dir = td / "work" / "myrepo"
+    wt_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "zhongzhu/legacy", str(wt_dir), "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Step 3: the next read should detect it and persist the path.
+    updated = detect_and_persist_worktree(repo, meta.slug)
+    assert updated is not None
+    assert updated.worktree_path == str(wt_dir.resolve())
+    assert updated.branch == "zhongzhu/legacy"
+    # Persisted to disk too.
+    assert read_meta(repo, meta.slug).worktree_path == str(wt_dir.resolve())
+
+
+def test_list_candidates_returns_self_when_project_root_is_git(tmp_path: Path) -> None:
+    from claudeloop.rud_task import list_worktree_candidates
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    cands = list_worktree_candidates(repo)
+    assert len(cands) == 1
+    assert cands[0]["kind"] == "self"
+    assert cands[0]["path"] == str(repo.resolve())
+
+
+def test_list_candidates_returns_children_when_root_is_container(tmp_path: Path) -> None:
+    """Container project root - xorl-style folder holding multiple git clones."""
+    from claudeloop.rud_task import list_worktree_candidates
+
+    container = tmp_path / "xorl"
+    container.mkdir()
+    for name in ("xorl-internal", "xorl-eval"):
+        _git_init_repo(container / name)
+    # Add a non-git directory and a hidden dir to make sure they're skipped.
+    (container / "scratch").mkdir()
+    (container / ".cache").mkdir()
+    cands = list_worktree_candidates(container)
+    names = sorted(c["name"] for c in cands)
+    assert names == ["xorl-eval", "xorl-internal"]
+    assert all(c["kind"] == "child" for c in cands)
+
+
+def test_prepare_task_worktree_from_child_repo(tmp_path: Path) -> None:
+    """Verify manual selection of a child repo creates a worktree under the
+    *task*, not under the container."""
+    from claudeloop.rud_task import prepare_task_worktree_from
+
+    container = tmp_path / "xorl"
+    container.mkdir()
+    child = container / "xorl-internal"
+    _git_init_repo(child)
+    meta = create_task(container, "review309", "goal", skills_path=None, auto_worktree=False)
+    # Container project root means create_task's auto-worktree skipped.
+    assert read_meta(container, meta.slug).worktree_path == ""
+    wt, branch, msg = prepare_task_worktree_from(container, meta.slug, child)
+    assert wt is not None, msg
+    assert wt == task_root(container, meta.slug) / "work" / "xorl-internal"
+    assert branch == f"zhongzhu/{meta.slug}"
+
+
+def test_multiple_worktrees_per_task(tmp_path: Path) -> None:
+    """Adding a second worktree appends to meta.worktrees instead of replacing."""
+    from claudeloop.rud_task import (
+        detect_and_persist_worktree,
+        list_task_worktrees,
+        prepare_task_worktree_from,
+    )
+
+    container = tmp_path / "xorl"
+    container.mkdir()
+    _git_init_repo(container / "xorl-internal")
+    _git_init_repo(container / "xorl-sglang")
+    meta = create_task(container, "rev309", "goal", skills_path=None, auto_worktree=False)
+
+    wt1, _, _ = prepare_task_worktree_from(container, meta.slug, container / "xorl-internal")
+    assert wt1 is not None
+    detect_and_persist_worktree(container, meta.slug)
+    after1 = read_meta(container, meta.slug)
+    assert after1.worktrees == [str(wt1)]
+    assert after1.worktree_path == str(wt1)
+    assert after1.branch == f"zhongzhu/{meta.slug}"
+    assert len(after1.branches) == 1
+
+    wt2, _, _ = prepare_task_worktree_from(container, meta.slug, container / "xorl-sglang")
+    assert wt2 is not None
+    detect_and_persist_worktree(container, meta.slug)
+    after2 = read_meta(container, meta.slug)
+    assert sorted(after2.worktrees) == sorted([str(wt1), str(wt2)])
+    assert len(after2.branches) == len(after2.worktrees)
+    # Every worktree gets the SAME branch name (zhongzhu/<slug>) - branches
+    # are scoped per repo so there's no collision.
+    expected_branch = f"zhongzhu/{meta.slug}"
+    assert after2.branches == [expected_branch, expected_branch]
+    # Primary stays as the first one (xorl-internal was added first).
+    assert after2.worktree_path == str(wt1)
+    assert list_task_worktrees(container, meta.slug)  # populated
+    # Verify each git repo really has its own independent zhongzhu/<slug>
+    # branch (proves the "same name across repos" guarantee).
+    for repo_root in (container / "xorl-internal", container / "xorl-sglang"):
+        result = subprocess.run(
+            ["git", "branch", "--list", expected_branch],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert expected_branch in result.stdout, (
+            f"{repo_root} missing branch {expected_branch!r}; got: {result.stdout!r}"
+        )
+
+
+def test_remove_task_worktree(tmp_path: Path) -> None:
+    from claudeloop.rud_task import (
+        detect_and_persist_worktree,
+        prepare_task_worktree_from,
+        remove_task_worktree,
+    )
+
+    container = tmp_path / "c"
+    container.mkdir()
+    _git_init_repo(container / "a")
+    _git_init_repo(container / "b")
+    meta = create_task(container, "t", "g", skills_path=None, auto_worktree=False)
+    wt_a, _, _ = prepare_task_worktree_from(container, meta.slug, container / "a")
+    wt_b, _, _ = prepare_task_worktree_from(container, meta.slug, container / "b")
+    detect_and_persist_worktree(container, meta.slug)
+    assert len(read_meta(container, meta.slug).worktrees) == 2
+
+    ok, msg = remove_task_worktree(container, meta.slug, wt_a)
+    assert ok, msg
+    after = read_meta(container, meta.slug)
+    assert after.worktrees == [str(wt_b)]
+    assert after.worktree_path == str(wt_b)
+    assert not wt_a.exists()
+
+
+def test_legacy_meta_single_worktree_migrates_to_list(tmp_path: Path) -> None:
+    """Pre-list-era task.json with only worktree_path should appear as a 1-item list."""
+    repo = tmp_path / "r"
+    _git_init_repo(repo)
+    meta = create_task(repo, "legacy", "g", skills_path=None)
+    # Tamper to look pre-migration: drop the lists field, keep singular.
+    meta_path = task_root(repo, meta.slug) / "task.json"
+    import json
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw.pop("worktrees", None)
+    raw.pop("branches", None)
+    meta_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    reloaded = read_meta(repo, meta.slug)
+    assert reloaded is not None
+    assert reloaded.worktrees == [reloaded.worktree_path]
+    assert reloaded.branches == [reloaded.branch]
+
+
+def test_worktree_status_reports_clean_then_dirty(tmp_path: Path) -> None:
+    from claudeloop.rud_task import worktree_status
+
+    repo = tmp_path / "r"
+    _git_init_repo(repo)
+    status = worktree_status(repo)
+    assert status is not None
+    assert status["clean"] is True
+    assert status["dirty_count"] == 0
+    assert status["branch"]  # e.g. "master" or "main"
+    assert status["has_remote"] is False
+    assert status["ahead"] == 0 and status["behind"] == 0
+
+    (repo / "new.txt").write_text("hi", encoding="utf-8")
+    (repo / "README.md").write_text("changed", encoding="utf-8")
+    dirty = worktree_status(repo)
+    assert dirty is not None
+    assert dirty["clean"] is False
+    assert dirty["untracked"] == 1
+    assert dirty["unstaged"] == 1
+    assert dirty["dirty_count"] == 2
+
+
+def test_worktree_status_handles_ahead_behind(tmp_path: Path) -> None:
+    """Set up an `origin` remote and verify ahead/behind parsing."""
+    from claudeloop.rud_task import worktree_status
+
+    upstream = tmp_path / "u"
+    _git_init_repo(upstream)
+    # Make `upstream` a bare-style "remote" by using a worktree clone.
+    clone = tmp_path / "c"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=clone, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=clone, check=True)
+    (clone / "x.txt").write_text("a", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=clone, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "one", "--no-gpg-sign", "-q"],
+        cwd=clone,
+        check=True,
+    )
+    s = worktree_status(clone)
+    assert s is not None
+    assert s["has_remote"] is True
+    assert s["ahead"] == 1
+    assert s["behind"] == 0
+
+
+def test_list_task_worktree_statuses(tmp_path: Path) -> None:
+    from claudeloop.rud_task import (
+        detect_and_persist_worktree,
+        list_task_worktree_statuses,
+        prepare_task_worktree_from,
+    )
+
+    container = tmp_path / "c"
+    container.mkdir()
+    _git_init_repo(container / "a")
+    _git_init_repo(container / "b")
+    meta = create_task(container, "wts", "g", skills_path=None, auto_worktree=False)
+    prepare_task_worktree_from(container, meta.slug, container / "a")
+    prepare_task_worktree_from(container, meta.slug, container / "b")
+    detect_and_persist_worktree(container, meta.slug)
+    statuses = list_task_worktree_statuses(container, meta.slug)
+    assert len(statuses) == 2
+    for s in statuses:
+        assert s["branch"] == f"zhongzhu/{meta.slug}"
+        assert s["clean"] is True
+
+
+def test_detect_worktree_clears_stale_path(tmp_path: Path) -> None:
+    """A recorded worktree_path that no longer exists on disk should be
+    re-detected (and replaced with the on-disk reality, or cleared)."""
+    from claudeloop.rud_task import detect_and_persist_worktree, update_meta
+
+    repo = tmp_path / "r"
+    _git_init_repo(repo)
+    meta = create_task(repo, "wt", "goal", skills_path=None)
+    # Pretend metadata pointed somewhere now missing.
+    update_meta(repo, meta.slug, worktree_path="/no/such/path")
+    refreshed = detect_and_persist_worktree(repo, meta.slug)
+    assert refreshed is not None
+    # On-disk worktree still exists, so detection picks it back up.
+    assert Path(refreshed.worktree_path).is_dir()

@@ -1,339 +1,219 @@
-# RUD CLAUDELOOP
+# claudeloop
 
-`claudeloop` is a local task console for running long Claude Code jobs safely inside git worktrees. The primary workflow is the web UI: create a task, run an interactive deep interview, create a task-scoped worktree, then launch a tmux worker/evaluator loop.
+A lightweight task console for Claude Code. You give each task a goal,
+the deep-interview Claude pane refines a `PLAN.md`, you spin up one or
+more git worktrees on `zhongzhu/<slug>` branches, and `/goal` your way
+through the work in the same Claude session — or any resumed one.
 
-## Prerequisites
+There is no agent loop, no autonomous worker, and no evaluator: you
+drive Claude yourself, the console just removes the bookkeeping.
 
-Install the package in editable mode:
+```
+┌─ Project root (e.g. ~/work/xorl) ──────────────────────────────────┐
+│ .RUD/                                                              │
+│ ├── NOTES.md            ← project-scoped scratchpad (Notes button) │
+│ ├── task-order.json                                                 │
+│ └── <slug>/                                                         │
+│     ├── task.json       ← title, goal, skills_path, worktrees,…    │
+│     ├── PLAN.md         ← deep-interview writes this, you edit it  │
+│     ├── INTERVIEW.md    ← transcript log of the deep-interview     │
+│     └── work/                                                       │
+│         ├── xorl-internal/   ← git worktree, branch zhongzhu/<slug>│
+│         └── xorl-sglang/     ← second worktree, same branch name   │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+## Install
 
 ```bash
 cd /path/to/claudeloop
 pip install -e .
-```
 
-Install and authenticate Claude Code before starting workers:
-
-```bash
+# Authenticate the Claude Code CLI used by the interview pane.
 claude
-# complete login/auth in the Claude Code CLI
 ```
 
-Install `tmux` and make sure the project you run from is a git repository:
+Optional but needed for the Claude pane:
 
 ```bash
-tmux -V
-git rev-parse --show-toplevel
+tmux -V       # tmux must be on PATH
+git --version
 ```
 
-## Start The Web UI
+## Run
 
-Start `claudeloop web` from the project repository you want agents to work on. That directory becomes the project root.
+From any directory:
 
 ```bash
-cd /path/to/your/project
-claudeloop web --port 8765
+claudeloop web --project /path/to/your/project --port 8765
+# open http://127.0.0.1:8765/
 ```
 
-Open:
+Useful flags:
 
-```text
-http://127.0.0.1:8765/
-```
-
-### Multi-project hub
-
-One `claudeloop web` process can manage several git project roots from the same browser UI. Registered paths are stored under `~/.claudeloop/web-projects.json`. The server **does not** auto-add your current working directory: use **Add** in the sidebar to register each repo (nothing is deleted when you **Remove**—that only drops the path from the list).
-
-Task APIs (`/api/project`, `/api/tasks`, …) are scoped with `?project=<id>` or the `X-ClaudeLoop-Project` header. `GET /api/tmux/sessions?project=<id>` lists only tmux sessions for that project. The project id is in the JSON from `GET /api/projects`. Remote-control scripts honor `CLAUDELOOP_PROJECT_ID`; see `claudeloop/skills/remote_control/remote_control.md`.
-
-Background mode:
+| Flag | Purpose |
+|------|---------|
+| `--project PATH` | Project root. Defaults to `$PWD`. Can be a git repo OR a container directory with several git repos inside. |
+| `--skills PATH` | Default skills markdown injected into every Claude session. Defaults to `claudeloop/skills/AK_skills.md`. |
+| `--projects` | Multi-project workspace: launch dir is a container; prune the parent registry entry once children are registered. |
+| `--auth-token TOKEN` | Require HTTP basic / bearer auth. Username can be anything; password = token. Also reads `CLAUDELOOP_WEB_AUTH_TOKEN`. |
+| `--daemon` / `--nohup` | Re-spawn in the background and exit. Logs land in `<project>/.RUD/web.log`. |
+| `--openclaw …` | Optional OpenClaw gateway events; full flag list in `claudeloop/cli.py`. |
 
 ```bash
-claudeloop web --nohup --log-file .RUD/web.log
+claudeloop init   # writes minimal PLAN.md + NOTES.md in $PWD
+claudeloop --help # all commands
 ```
 
-Useful options:
+## Web UI flow
 
-- `--project PATH`: use a project root other than the current directory.
-- `--skills PATH`: default skills markdown for new tasks. The packaged default is `claudeloop/skills/AK_skills.md`.
-- `--work-dir PATH`: optional default repo source for worktree creation. If omitted, the current project root is used.
-- `--interview-backend cli|sdk`: defaults to `cli`.
-- `--auth-token TOKEN`: require HTTP auth for the web UI and API. Browser username can be anything; password is the token. API clients can send `Authorization: Bearer TOKEN`.
-- `--openclaw`: enable direct claudeloop -> OpenClaw gateway events.
-- `--openclaw-url URL`: OpenClaw hooks URL, usually `http://127.0.0.1:18789/hooks/wake`.
-- `--openclaw-token TOKEN`: OpenClaw hooks token, sent as `Authorization: Bearer TOKEN`.
-- `--openclaw-header "Name: value"`: request header for the gateway; repeatable.
-- `--openclaw-config PATH`: claudeloop OpenClaw JSON config.
-- `--openclaw-debug`: print OpenClaw delivery status.
+### 1. Register a project
 
-## OpenClaw Integration
+Use **+ Add repo** in the top bar. Anything you register is just stored
+in `~/.claudeloop/web-projects.json` (no files are written outside the
+registered path). Pick from the subfolder chips if the launch directory
+is a container.
 
-Use OpenClaw only as a notification/control bridge:
+### 2. Create a task
 
-- claudeloop sends events to OpenClaw with `POST /hooks/wake`.
-- OpenClaw or another remote agent can call back to claudeloop through the web API.
-- Detailed commands and examples live in `claudeloop/skills/remote_control/remote_control.md`.
+**Create Task** asks only for two things:
 
-On the OpenClaw host, enable Gateway HTTP hooks and keep the token:
+- **Title** — becomes the slug (lowercased, dash-separated).
+- **General goal** — a short description; the deep-interview will turn
+  it into PLAN.md.
+
+A `.RUD/<slug>/` directory is created with an empty `PLAN.md`. If the
+project root is itself a git repo, **one worktree is auto-created** at
+`.RUD/<slug>/work/<repo-name>/` on branch `zhongzhu/<slug>`. Container
+projects (no `.git` of their own) skip auto-creation — you'll pick the
+source repo from the Claude tab.
+
+You can rename the title or rewrite the goal at any time by clicking on
+them in the task header.
+
+### 3. The Claude tab
+
+Each task has a single Claude tab with:
+
+- **Worktrees** card — list of every git worktree owned by this task,
+  with branch, live `git status` (clean / N modified / ↑3 ↓2), and a
+  **Push** button per row. **+ Add worktree** opens a picker showing
+  candidate git repos (project root if it's a repo, else direct
+  children); already-added ones are dimmed. **Push all** pushes every
+  branch in one go. The × removes a worktree (calls
+  `git worktree remove`).
+- **Sessions** card — every Claude Code session UUID the pane has ever
+  spawned (collected by scanning `~/.claude/projects/<encoded-cwd>/`).
+  Click **Resume** on any session to launch a fresh tmux pane with
+  `claude --resume <uuid>` — works even if the original tmux was
+  killed.
+- **Live tmux pane** preview that polls every 4s.
+- INTERVIEW.md raw + rendered view underneath.
+
+Starting the pane runs `tmux new-session` + `claude` in the **primary**
+worktree (the first entry in the worktrees list) and pastes the
+deep-interview prompt 5 seconds later. Special keys (↑ ↓ ← → Enter Esc
+Ctrl-C) live in a keycap row next to the textarea.
+
+### 4. PLAN.md tab
+
+A markdown editor + live preview for `.RUD/<slug>/PLAN.md`. The Save
+button has a `•` dot when there are unsaved changes; **Cmd / Ctrl + S**
+saves. The interview pane writes here when you click *Start Claude* the
+first time; afterwards you edit and `/goal` against it inside the
+Claude pane.
+
+### 5. Notes (project-scoped)
+
+The **📓 Notes** button in the top bar opens a fullscreen modal editor
+for `<project>/.RUD/NOTES.md`. One file per project, persistent, not
+tied to a task. Use it for future ideas, open questions, links to PRs,
+etc. **Cmd / Ctrl + S** saves.
+
+## CLI reference
+
+There are only two CLI commands now (everything else lives in the web
+UI):
 
 ```bash
-SECRET="$(openssl rand -hex 32)"
-printf '{ hooks: { enabled: true, token: "%s", path: "/hooks" } }\n' "$SECRET" \
-  | openclaw config patch --stdin
-openclaw gateway restart
-echo "$SECRET"
+claudeloop init                          # PLAN.md + NOTES.md in $PWD
+claudeloop web --project DIR --port N    # the web UI
+claudeloop web --daemon                  # background; logs to .RUD/web.log
 ```
 
-From the claudeloop machine, keep the SSH tunnel open:
+## Storage layout
 
-```bash
-ssh -N \
-  -i ~/.ssh/id_ed25519 \
-  -L 18789:127.0.0.1:18789 \
-  -R 8765:127.0.0.1:8765 \
-  charles@34.102.85.57
+```
+<project>/.RUD/
+├── NOTES.md              # project-scoped scratch (📓 Notes button)
+├── task-order.json
+└── <slug>/
+    ├── task.json
+    ├── PLAN.md
+    ├── INTERVIEW.md
+    └── work/
+        └── <repo>/...    # git worktree, branch zhongzhu/<slug>
 ```
 
-Start claudeloop with OpenClaw notifications and optional web auth:
-
-```bash
-export OPENCLAW_HOOK_TOKEN="token-from-openclaw"
-export CLAUDELOOP_WEB_AUTH_TOKEN="$(openssl rand -hex 24)"
-
-claudeloop web \
-  --auth-token "$CLAUDELOOP_WEB_AUTH_TOKEN" \
-  --openclaw \
-  --openclaw-url http://127.0.0.1:18789/hooks/wake \
-  --openclaw-token "$OPENCLAW_HOOK_TOKEN" \
-  --openclaw-debug
+```
+~/.claude/projects/<encoded-cwd>/
+└── <session-uuid>.jsonl  # native Claude Code session transcripts
 ```
 
-For remote-control scripts, task status checks, tmux pane capture, and safe runner commands, use:
-
-```text
-claudeloop/skills/remote_control/remote_control.md
+```
+~/.claudeloop/
+└── web-projects.json     # registered project paths
 ```
 
-## Web Workflow
+## HTTP API
 
-### 1. Create Task
+Everything is plain JSON; pass `?project=<id>` (or the
+`X-ClaudeLoop-Project` header) to scope.
 
-Click `Create Task` and enter:
+| Method | URL | Purpose |
+|--------|-----|---------|
+| `GET`  | `/api/project` | Active project root + skills path |
+| `GET`  | `/api/projects` | List registered projects, default, launch root |
+| `POST` | `/api/projects` `{path}` | Register a project root |
+| `POST` | `/api/projects/<id>/activate` | Set the default project |
+| `POST` | `/api/projects/<id>/move` `{direction}` | Reorder |
+| `POST` | `/api/projects/reorder` `{ids}` | Persist arbitrary order |
+| `DELETE` | `/api/projects/<id>` | Drop from registry (files untouched) |
+| `GET`  | `/api/notes` | Project NOTES.md |
+| `PUT`  | `/api/notes` `{content}` | Save project NOTES.md |
+| `GET`  | `/api/tasks` | All tasks for the active project |
+| `POST` | `/api/tasks` `{title, general_goal}` | Create task (auto-worktree if project root is a git repo) |
+| `POST` | `/api/tasks/reorder` `{slugs}` | Persist order |
+| `GET`  | `/api/tasks/<slug>` | Meta + PLAN.md + INTERVIEW.md + Claude summary + worktree statuses |
+| `PUT`  | `/api/tasks/<slug>/meta` `{title?, general_goal?}` | Rename / re-goal |
+| `PUT`  | `/api/tasks/<slug>/template` `{name, content}` | Write PLAN.md |
+| `DELETE` | `/api/tasks/<slug>` | Delete task tree (also unregisters worktrees) |
+| `GET`  | `/api/tasks/<slug>/worktree-candidates` | Repos you could base a worktree on |
+| `POST` | `/api/tasks/<slug>/worktree` `{source_repo}` | Create a worktree |
+| `DELETE` | `/api/tasks/<slug>/worktree?path=…` | `git worktree remove` + prune meta |
+| `POST` | `/api/tasks/<slug>/worktree/push` `{path}` | `git push -u origin <branch>` |
+| `POST` | `/api/tasks/<slug>/worktrees/push-all` | Push every task worktree branch |
+| `POST` | `/api/tasks/<slug>/claude/start` | Launch Claude pane in primary worktree |
+| `POST` | `/api/tasks/<slug>/claude/stop` | Kill tmux pane (sessions on disk stay resumable) |
+| `POST` | `/api/tasks/<slug>/claude/resume` `{session_id}` | New tmux, `claude --resume <id>` |
+| `GET`  | `/api/tasks/<slug>/claude-sessions` | Tracked UUIDs + on-disk transcripts |
+| `GET`  | `/api/tmux/sessions?project=<id>` | claudeloop-related tmux sessions for that project |
+| `GET`  | `/api/tmux/capture?target=…&lines=N` | Pane scrollback |
+| `POST` | `/api/tmux/send-text` `{target, text, submit}` | Type into a pane |
+| `POST` | `/api/tmux/send-key` `{target, key}` | Send a tmux key |
 
-- `Title`: used to create the task slug.
-- `General goal`: a rough description of what you want.
+(For backwards compatibility, `/api/tasks/<slug>/interview/{start,stop}`
+still resolves to the Claude pane endpoints.)
 
-This creates:
+## What this used to be
 
-```text
-<project>/.RUD/<task>/
-├── TASK_PROMPT.md
-├── SUCCESS_CONDITION.md
-├── PLAN.md
-├── INTERVIEW.md
-├── work/
-└── runs/
-```
+Earlier versions had a full `claudeloop run` / `claudeloop tmux` agent
+loop with runner / evaluator panes, plus an `Ask` pane, plus a
+TASK_PROMPT.md + SUCCESS_CONDITION.md + auto-commit + multi-repo
+worktree picker, plus integration with an external "OpenClaw" gateway
+for wake-up signals. The agent loop was deleted on purpose — the new
+flow is "human drives Claude Code, console keeps the worktrees and
+notes tidy".
 
-Creating a task does not start tmux and does not create a worktree.
-
-### 2. Run Deep Interview
-
-Open the `Interview` tab and click `Start deep-interview`.
-
-This starts a dedicated Claude Code tmux session:
-
-```text
-claudeloop-interview-<task>
-```
-
-The interview pane receives an automatic prompt with `effort=max`. You can interact with it from the web UI: send text, press Enter, arrows, Esc, or Ctrl-C. The interview should refine and write:
-
-- `<project>/.RUD/<task>/TASK_PROMPT.md`
-- `<project>/.RUD/<task>/SUCCESS_CONDITION.md`
-- `<project>/.RUD/<task>/PLAN.md`
-
-Stop it with `Stop deep-interview`, which kills the interview tmux session.
-
-### 3. Review And Edit Markdown
-
-Use the `PLAN.md`, `TASK_PROMPT.md`, and `SUCCESS_CONDITION.md` tabs to edit task files. Each tab has a raw Markdown editor and live preview.
-
-`PLAN.md` is the authoritative task state file. Workers are prompted to keep task status, decisions, next steps, and progress logs in this file, especially the `Progress Log` section. Source code changes happen in the worktree; task-management notes should not be scattered through the repo.
-
-### 4. Create Worktree
-
-Open the `Worker` tab and click `Create worktree`.
-
-By default this creates:
-
-```text
-<project>/.RUD/<task>/work/<repo>
-```
-
-For nested git repos one level deep, it can also create:
-
-```text
-<project>/.RUD/<task>/work/<repo>/<nested-repo>
-```
-
-The worker will run from the selected worktree, not from the original repository checkout.
-
-### 5. Start Worker
-
-In the `Worker` tab:
-
-1. Select a repo from the `Repo` dropdown.
-2. Choose the model and max rounds.
-3. Click `Start worker`.
-
-The web UI starts:
-
-```bash
-python -m claudeloop tmux \
-  --prompt <project>/.RUD/<task>/TASK_PROMPT.md \
-  --success <project>/.RUD/<task>/SUCCESS_CONDITION.md \
-  --plan <project>/.RUD/<task>/PLAN.md \
-  --log-dir <project>/.RUD/<task>/runs/<repo>/agent_logs \
-  --max-rounds 200 \
-  --model claude-opus-4-6 \
-  --dangerously-skip-permissions \
-  --effort max \
-  --no-commit \
-  --session-name claudeloop-<task>-<repo>
-```
-
-The controller process runs in the background. The runner/evaluator panes live in tmux.
-
-### 6. Watch Or Attach
-
-The `Runner / Evaluator` tab previews both tmux panes.
-
-To attach manually:
-
-```bash
-tmux attach -t claudeloop-<task>-<repo>
-```
-
-Inside tmux:
-
-- Switch panes: `Ctrl-b` then arrow key.
-- Detach without stopping: `Ctrl-b d`.
-
-Logs:
-
-```text
-<project>/.RUD/<task>/runs/<repo>/worker.log
-<project>/.RUD/<task>/runs/<repo>/agent_logs/
-```
-
-### 7. Stop Worker
-
-Click `Stop task` in the `Worker` tab.
-
-This stops the background controller process and kills the corresponding tmux session, including runner and evaluator panes.
-
-## Tmux Controller Mode
-
-`claudeloop tmux` is the main execution engine used by the web UI. It creates one tmux session with two Claude Code panes and one background Python controller process.
-
-```text
-tmux session: claudeloop-<task>-<repo>
-
-pane 0: runner
-  - interactive Claude Code
-  - edits code in the worktree
-  - updates the task PLAN.md
-
-pane 1: evaluator
-  - interactive Claude Code
-  - runs checks from SUCCESS_CONDITION.md
-  - reports whether the task is done
-
-background controller process
-  - polls tmux panes
-  - detects idle state
-  - asks evaluator to verify
-  - sends feedback back to runner
-  - exits on success, max rounds, error, or Stop task
-```
-
-Manual usage:
-
-```bash
-claudeloop tmux \
-  --prompt TASK_PROMPT.md \
-  --success SUCCESS_CONDITION.md \
-  --plan PLAN.md \
-  --model claude-opus-4-6 \
-  --max-rounds 200 \
-  --effort max \
-  --dangerously-skip-permissions \
-  --no-commit
-```
-
-Important options:
-
-- `--prompt, -p`: task prompt path.
-- `--success, -s`: success condition path.
-- `--plan`: plan/progress path.
-- `--max-rounds`, `--max-iters`, `-n`: maximum controller rounds.
-- `--model, -m`: Claude model for runner and evaluator.
-- `--session-name`: explicit tmux session name.
-- `--log-dir`: logs and session state.
-- `--resume`: reconnect to a previous tmux session using the log directory.
-- `--effort, -e`: Claude Code effort level, including `max`.
-- `--dangerously-skip-permissions`: skip Claude Code permission prompts.
-- `--allowed-tools`: comma-separated tools to auto-approve when not skipping permissions.
-- `--additional-prompt`: extra text appended to the task prompt.
-
-## Directory Layout
-
-For a project at `/path/to/project` and task `qwen34b`:
-
-```text
-/path/to/project/.RUD/qwen34b/
-├── TASK_PROMPT.md
-├── SUCCESS_CONDITION.md
-├── PLAN.md
-├── INTERVIEW.md
-├── task.json
-├── work/
-│   └── project/
-└── runs/
-    └── project/
-        ├── process.json
-        ├── worker.log
-        └── agent_logs/
-```
-
-The original repo stays separate from task work. The worker edits files under `work/<repo>`. The authoritative task state stays in `.RUD/<task>/PLAN.md`.
-
-## Subprocess Mode
-
-`claudeloop run` is the simpler subprocess mode. It spawns a fresh Claude Code subprocess per iteration and re-sends the prompt each time. Prefer the web UI and tmux mode for long interactive jobs.
-
-```bash
-claudeloop run \
-  --prompt TASK_PROMPT.md \
-  --success SUCCESS_CONDITION.md \
-  --plan PLAN.md \
-  --model claude-opus-4-6 \
-  --max-iters 20 \
-  --effort max \
-  --dangerously-skip-permissions
-```
-
-## Template Init
-
-For manual workflows outside `.RUD`, create starter files in the current directory:
-
-```bash
-claudeloop init
-```
-
-This writes:
-
-- `TASK_PROMPT.md`
-- `SUCCESS_CONDITION.md`
-- `PLAN.md`
+If you need the old behaviour, check `git log` for the `Remove worker
+tab and append K8S notes…` commit and earlier.

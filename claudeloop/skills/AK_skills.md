@@ -7,15 +7,16 @@
 - Use pods/jobs/nodes to scale experiments, and clean up old completed or failed jobs when done.
 - Save all results, logs, configs, and notes under the task directory.
 - Use wandb for run tracking; the user is already logged in.
-- Use the existing `HF_TOKEN` 
+- Use the existing `HF_TOKEN`
 - Use `/shared/huggingface` for Hugging Face cache (`HF_HOME`, `TRANSFORMERS_CACHE`, `HF_DATASETS_CACHE`)! DO NOT USE ~/.cache/huggingface!
 - some node NCCL/IB/GPU might be inhealthy, the cluster has these information, please be careful to check
 - branch/worktree name use zhongzhu/xxxx as the name, also for PR, etc.
 - don't create PR, review by your self; just leave everything in the local worktree.
 - for review, list review like "- code line xxx comment review xxx" simple & clean
 - don't make author / co-author as claude / cursor or ai agent.
-- 如果在claudeloop文件夹中 记得更新文件夹最外面的 PLAN TASK SUCESS 三个markdown；主要是PLAN 我们会根据PLAN检查进度。
+- 如果在claudeloop文件夹中 记得更新文件夹中的 PLAN.md markdown；我们会根据PLAN来汇总进度和成果。
 - 如果本机local 有free GPU 没有人使用的 你可以尝试使用。
+- 如果是生成review的任务 请你生成一个reivew.md markdown文件，里面包含review的详细内容，每一bullet point代表一个review comment 写清楚行数在哪，应该怎么改进。尽量写的都是一些关键影响会error的line of code。
 
 # CLAUDE.md
 

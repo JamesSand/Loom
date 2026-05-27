@@ -1,13 +1,16 @@
 # Plan
 
-## Status
-Not started
+## Goal
+<!-- One short paragraph describing what success looks like.  The deep-interview
+     pane normally rewrites this whole section for you. -->
 
-## Tasks
-- [ ] TODO: First concrete task
+## Constraints / non-goals
+
+## Acceptance
+- [ ] How will we know it's done?
 
 ## Next steps
-1. Confirm repo layout and run baseline tests (if any)
+- [ ] First action
 
 ## Progress Log
-<!-- Updated by the worker each iteration -->
+<!-- Append concise dated entries here as work happens. -->
