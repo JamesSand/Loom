@@ -1263,7 +1263,7 @@ def git_toplevel(path: Path) -> Path | None:
 
 
 def _branch_name_for(slug: str) -> str:
-    # Per AK_skills.md the user wants branches under zhongzhu/<slug>.
+    # Per charlie_skills.md the user wants branches under zhongzhu/<slug>.
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", slug).strip("-") or "task"
     return f"zhongzhu/{cleaned[:80]}"
 

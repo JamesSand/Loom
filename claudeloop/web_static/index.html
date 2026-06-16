@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Loom</title>
   <link rel="icon" type="image/png" href="/static/loom-logo.png" />
-  <link rel="stylesheet" href="/static/app.css?v=20260613-5" />
+  <link rel="stylesheet" href="/static/app.css?v=20260616-1" />
 </head>
 <body>
   <header class="topbar">
@@ -75,7 +75,6 @@
             <div class="task-view__heading">
               <h1 class="task-view__title" id="task-title">…</h1>
               <div class="task-view__meta">
-                <span class="badge" id="task-slug">…</span>
                 <span id="task-backend"></span>
               </div>
             </div>
@@ -83,6 +82,7 @@
           </div>
           <p class="tab-panel__hint" id="task-goal"></p>
         </header>
+        <nav class="tabs" id="main-tabs" role="tablist"></nav>
         <section class="tab-panel active" data-panel="claude" role="tabpanel">
           <p class="tab-panel__hint">Loom loop: start from the general goal, interview into PLAN.md, run <code>/goal</code> against PLAN.md, then write progress and results back into PLAN.md.</p>
           <input type="hidden" id="inp-interview-target" />
@@ -141,7 +141,6 @@
                   <span class="switch__track"><span class="switch__thumb"></span></span>
                   <span class="switch__text">Notify</span>
                 </label>
-                <span class="claude-info__hint monitor-status" id="monitor-status"></span>
               </div>
             </div>
           </div>
@@ -294,6 +293,7 @@
           <option value="claude">Claude — claude CLI, resume by UUID</option>
           <option value="codex">Codex — codex CLI, codex resume &lt;id&gt;</option>
           <option value="kernel">Kernel Lab — TKCC kernel optimization</option>
+          <option value="aris">ARIS — autonomous research loop</option>
         </select>
         <p class="create-agent-hint" id="new-agent-hint"></p>
         <label for="new-goal">General goal</label>
@@ -400,6 +400,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260613-5"></script>
+  <script src="/static/app.js?v=20260616-1"></script>
 </body>
 </html>

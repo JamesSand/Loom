@@ -753,3 +753,13 @@ def test_parse_patch_files_splits_per_file() -> None:
     assert files[0]["additions"] == 1 and files[0]["deletions"] == 1
     assert files[1]["status"] == "added"
     assert files[1]["additions"] == 1
+
+
+def test_create_task_aris_kind(tmp_path: Path) -> None:
+    meta = create_task(
+        tmp_path, "explore kv", "find kv-cache wins", skills_path=None,
+        kind="aris", auto_worktree=False,
+    )
+    assert meta.kind == "aris"
+    reloaded = read_meta(tmp_path, meta.slug)
+    assert reloaded is not None and reloaded.kind == "aris"

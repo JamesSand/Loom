@@ -8,7 +8,7 @@ _PKG = Path(__file__).resolve().parent
 
 
 def bundled_skills_path() -> Path:
-    return _PKG / "skills" / "AK_skills.md"
+    return _PKG / "skills" / "charlie_skills.md"
 
 
 def web_static_dir() -> Path:

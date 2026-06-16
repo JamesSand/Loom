@@ -702,6 +702,43 @@ def _build_claude_prompt(
     if skills_path.is_file():
         skills = skills_path.read_text(encoding="utf-8", errors="replace")[:12000]
     plan_path = td / PLAN
+    if (meta.kind or "").strip().lower() == "aris":
+        aris_skill_path = bundled_skills_path().parent / "aris" / "ARIS.md"
+        aris_skill = ""
+        if aris_skill_path.is_file():
+            aris_skill = aris_skill_path.read_text(encoding="utf-8", errors="replace")[:20000]
+        return f"""You are running an ARIS (Auto Research In Sleep) task in Loom -
+an autonomous research / optimization loop driven by you.
+
+Task directory:
+{td}
+
+{wt_line}
+
+Experiment worktrees go under: {td / "work"}/
+
+General goal (your research objective):
+{meta.general_goal}
+
+PLAN.md ledger (your single source of truth):
+{plan_path}
+
+=== ARIS methodology - follow this exactly ===
+{aris_skill or "(ARIS skill missing)"}
+=== end ARIS methodology ===
+
+Domain skills (extra context for this base):
+---
+{skills or "(none)"}
+---
+
+Begin now: read {plan_path}; if it has no ledger yet, bootstrap it from the
+General goal (Goal + Baseline + a ranked Idea backlog). Then start cycle 1 -
+branch a worktree under work/ for the top idea, run a real experiment, and
+record the result back into {plan_path}. Keep running cycles autonomously;
+only pause for the human checkpoints listed in the methodology. PLAN.md is the
+ONLY task-state file - do not create other status files.
+"""
     return f"""You are running Loom's {agent_label(meta.agent)} pane for this task.
 
 You are in the task directory:
@@ -1318,6 +1355,29 @@ class TaskMonitorManager:
             "last_match": (mon.last_match if (mon and mon.last_match) else cfg.get("last_match", "")),
         }
 
+    def resume_enabled(self, projects: list[tuple[str, Path]]) -> int:
+        """Start monitors for every task whose monitor.json has enabled=true.
+
+        Called once at startup so the per-task Notify toggle survives a server
+        restart without the user re-opening each task. *projects* is a list of
+        ``(project_id, project_root)`` pairs.
+        """
+        started = 0
+        for project_id, root in projects:
+            try:
+                metas = list_tasks(root)
+            except Exception:  # noqa: BLE001
+                continue
+            for meta in metas:
+                try:
+                    cfg = read_task_monitor(root, meta.slug)
+                    if cfg.get("enabled"):
+                        self.enable(root, project_id, meta.slug, cfg.get("pattern", ""))
+                        started += 1
+                except Exception:  # noqa: BLE001
+                    continue
+        return started
+
 
 # --- HTTP handler factory ---------------------------------------------------
 
@@ -1331,13 +1391,14 @@ def make_handler(
     auth_token: str = "",
     *,
     multi_project_workspace: bool = False,
+    monitor_manager: "TaskMonitorManager | None" = None,
 ) -> type[BaseHTTPRequestHandler]:
     static_root = web_static_dir().resolve()
     required_token = auth_token.strip()
     pr = project_registry
     launch_root_resolved = launch_root.resolve()
     multi_ws = multi_project_workspace
-    monitor_manager = TaskMonitorManager(openclaw_client)
+    monitor_manager = monitor_manager or TaskMonitorManager(openclaw_client)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1507,7 +1568,7 @@ def make_handler(
                         "projectRoot": str(root),
                         "projectId": pid,
                         "skillsPath": str(sk),
-                        "skillsBundledRelative": "claudeloop/skills/AK_skills.md",
+                        "skillsBundledRelative": "claudeloop/skills/charlie_skills.md",
                         "skillsOptions": _available_skill_options(sk, root),
                     }
                 )
@@ -2045,7 +2106,9 @@ def make_handler(
                     skills_path=skills_path,
                     interview_model=str(body.get("interview_model", "")),
                     agent=raw_agent or AGENT_CLAUDE,
-                    kind=("kernel" if str(body.get("kind", "")).strip().lower() == "kernel" else "agent"),
+                    kind={"kernel": "kernel", "aris": "aris"}.get(
+                        str(body.get("kind", "")).strip().lower(), "agent"
+                    ),
                 )
                 cands = list_worktree_candidates(root)
                 hint = ""
@@ -2831,6 +2894,7 @@ def serve(
         web_project_registry.prune_redundant_parent_projects(project_root)
     claude_registry = ClaudeRegistry()
     openclaw_client = OpenClawClient(openclaw_config)
+    monitor_manager = TaskMonitorManager(openclaw_client)
     # A launch/prepare runs in a background thread that does NOT survive a server
     # restart, leaving its run record stuck at "launching"/"resolving" forever.
     # On startup, no launch can be in flight, so sweep any such records to error.
@@ -2845,6 +2909,19 @@ def serve(
     _swept = _sweep_stale_kernel_runs(list(_sweep_roots))
     if _swept:
         print(f"  Swept {_swept} stale kernel run(s) (launching/resolving -> error)", flush=True)
+    # Resume per-task run monitors that were left enabled, so the Notify toggle
+    # survives a server restart without re-opening each task.
+    _monitor_projects: list[tuple[str, Path]] = []
+    try:
+        for _p in web_project_registry.list_projects():
+            _pid, _pp = _p.get("id"), _p.get("path")
+            if _pid and _pp:
+                _monitor_projects.append((str(_pid), Path(_pp)))
+    except Exception:  # noqa: BLE001
+        pass
+    _resumed = monitor_manager.resume_enabled(_monitor_projects)
+    if _resumed:
+        print(f"  Resumed {_resumed} enabled run-monitor(s)", flush=True)
     sk = default_skills if default_skills.is_file() else bundled_skills_path().resolve()
     handler = make_handler(
         web_project_registry,
@@ -2854,6 +2931,7 @@ def serve(
         openclaw_client,
         auth_token,
         multi_project_workspace=multi_project_workspace,
+        monitor_manager=monitor_manager,
     )
     server = ThreadingHTTPServer((host, port), handler)
     rud_root = project_root / ".RUD"

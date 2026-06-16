@@ -92,7 +92,7 @@ def web_cmd(
     skills: Path = typer.Option(
         bundled_skills_path(),
         "--skills",
-        help="Default skills markdown for new tasks (package default: claudeloop/skills/AK_skills.md)",
+        help="Default skills markdown for new tasks (package default: claudeloop/skills/charlie_skills.md)",
     ),
     daemon: bool = typer.Option(
         False,

@@ -80,7 +80,7 @@ Useful flags:
 | Flag | Purpose |
 |------|---------|
 | `--project PATH` | Project root. Defaults to `$PWD`. Can be a git repo OR a container directory holding several git repos. |
-| `--skills PATH` | Default skills markdown injected into every agent session. Defaults to `claudeloop/skills/AK_skills.md`. The per-task Skills picker only lists markdown under the skills directory. |
+| `--skills PATH` | Default skills markdown injected into every agent session. Defaults to `claudeloop/skills/charlie_skills.md`. The per-task Skills picker only lists markdown under the skills directory. |
 | `--projects` | Multi-project workspace: the launch dir is a container; the parent registry entry is pruned once children are registered. |
 | `--auth-token TOKEN` | Require HTTP basic / bearer auth. Username is ignored; password = token. Also reads `CLAUDELOOP_WEB_AUTH_TOKEN`. |
 | `--daemon` / `--nohup` | Re-spawn in the background and exit. Logs land in `<project>/.RUD/web.log`. |

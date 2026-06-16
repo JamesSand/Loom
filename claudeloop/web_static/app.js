@@ -29,6 +29,11 @@ const DEFAULT_TAB = TABS[0].id;
 const AGENT_LABELS = { claude: 'Claude', codex: 'Codex' };
 function agentLabel(name) { return AGENT_LABELS[(name || '').toLowerCase()] || 'Claude'; }
 function normalizeAgent(name) { return AGENT_LABELS[(name || '').toLowerCase()] ? name.toLowerCase() : 'claude'; }
+function taskBackendLabel(meta) {
+  meta = meta || {};
+  const base = `${agentLabel(meta.agent)}${meta.interview_model ? ' · ' + meta.interview_model : ''}`;
+  return meta.kind === 'aris' ? `ARIS · ${base}` : base;
+}
 
 const STATE = {
   slug: null,
@@ -1044,8 +1049,7 @@ async function selectTask(slug) {
     $('#task-empty').hidden = true;
     $('#task-view').hidden = false;
     $('#task-title').textContent = cached.title || slug;
-    $('#task-slug').textContent = cached.slug;
-    $('#task-backend').textContent = `${agentLabel(cached.agent)}${cached.interview_model ? ' · ' + cached.interview_model : ''}`;
+    $('#task-backend').textContent = taskBackendLabel(cached);
     $('#task-goal').textContent = cached.general_goal || '';
     $('#inp-interview-target').value = cached.tmux_interview_target || '';
     setTmuxOutputText(cached.tmux_interview_target
@@ -1085,8 +1089,7 @@ async function selectTask(slug) {
   $('#task-empty').hidden = true;
   $('#task-view').hidden = false;
   $('#task-title').textContent = d.meta.title || slug;
-  $('#task-slug').textContent = d.meta.slug;
-  $('#task-backend').textContent = `${agentLabel(d.meta.agent)}${d.meta.interview_model ? ' · ' + d.meta.interview_model : ''}`;
+  $('#task-backend').textContent = taskBackendLabel(d.meta);
   $('#task-goal').textContent = d.meta.general_goal || '';
   STATE.currentMeta = d.meta || null;
   STATE.worktreeStatuses = d.worktree_statuses || [];
@@ -1122,7 +1125,7 @@ function applyAgentLabels(meta) {
   const pasteBtn = document.getElementById('btn-interview-paste');
   const stopBtn = document.getElementById('btn-interview-stop');
   if (startBtn) startBtn.textContent = `Start ${label}`;
-  if (pasteBtn) pasteBtn.textContent = 'Start Deep Interview';
+  if (pasteBtn) pasteBtn.textContent = (meta && meta.kind === 'aris') ? 'Start ARIS loop' : 'Start Deep Interview';
   if (stopBtn) stopBtn.textContent = `Stop ${label}`;
   const heading = document.querySelector('.tab-panel[data-panel="claude"] .terminal-card__bar h4');
   if (heading) heading.textContent = `${label} Terminal`;
@@ -1556,20 +1559,8 @@ function formatMonitorTime(iso) {
 function applyMonitorState(d) {
   const toggle = document.getElementById('monitor-toggle');
   if (!toggle) return;
-  const running = !!(d && d.running);
-  toggle.checked = running;
-  // No "off"/"on" word - the toggle itself shows state. Only surface the
-  // last-fired info when there's something to report.
-  const status = document.getElementById('monitor-status');
-  if (status) {
-    let txt = '';
-    if (d && d.last_fired) {
-      txt = 'last fired ' + formatMonitorTime(d.last_fired);
-      if (d.last_match) txt += ' (' + d.last_match + ')';
-    }
-    status.textContent = txt;
-    status.classList.toggle('is-on', running);
-  }
+  // The toggle itself shows on/off state - no extra status text.
+  toggle.checked = !!(d && d.running);
 }
 
 async function loadMonitor() {
@@ -1589,7 +1580,6 @@ async function loadMonitor() {
 async function setMonitor(enabled) {
   if (!STATE.slug) return;
   const slug = STATE.slug;
-  const status = document.getElementById('monitor-status');
   STATE.monitorBusy = true;
   try {
     let d;
@@ -1605,7 +1595,7 @@ async function setMonitor(enabled) {
     if (STATE.slug !== slug) return;
     applyMonitorState(d);
   } catch (err) {
-    if (status) status.textContent = 'error: ' + err.message;
+    console.debug('setMonitor failed', err);
     STATE.monitorBusy = false;
     loadMonitor();
   } finally {
@@ -1797,6 +1787,7 @@ const AGENT_HINTS = {
   claude: 'Claude Code pane. Resume a past session by UUID.',
   codex: 'Codex CLI pane. Resume with codex resume <id>.',
   kernel: 'TKCC kernel optimization. The task view becomes the Kernel Lab.',
+  aris: 'Autonomous research loop: the agent mines ideas from the base repo, runs a worktree experiment per idea, and folds results back into PLAN.md.',
 };
 
 function updateCreateAgentHint() {
@@ -3031,9 +3022,10 @@ document.getElementById('btn-new-task').addEventListener('click', async () => {
   btn.disabled = true;
   status.textContent = 'Creating…';
   try {
-    const isKernel = agent === 'kernel';
-    const body = { title, general_goal, agent: isKernel ? 'claude' : agent };
-    if (isKernel) body.kind = 'kernel';
+    const special = agent === 'kernel' || agent === 'aris';
+    const body = { title, general_goal, agent: special ? 'claude' : agent };
+    if (agent === 'kernel') body.kind = 'kernel';
+    else if (agent === 'aris') body.kind = 'aris';
     if (skills_path) body.skills_path = skills_path;
     const { meta } = await api('/api/tasks', { method: 'POST', body: JSON.stringify(body) });
     resetCreateForm();

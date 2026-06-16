@@ -669,7 +669,7 @@ select:focus-visible { outline: none; border-color: var(--border-focus); box-sha
   padding: 6px 10px 6px 14px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 247, 243, 0.9));
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   box-shadow: 0 1px 0 rgba(31, 35, 48, 0.04);
 }
 .interview-md-bar__label {
@@ -740,7 +740,7 @@ select:focus-visible { outline: none; border-color: var(--border-focus); box-sha
 }
 @media (max-width: 720px) {
   .interview-md-bar {
-    border-radius: 16px;
+    border-radius: var(--radius-sm);
     padding: 10px 12px;
     gap: 8px;
   }
@@ -2101,6 +2101,35 @@ textarea.editable__input {
   /* Honour iOS safe areas so nothing hides behind the home indicator. */
   .main { padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
   .sidebar { padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
+}
+
+@media (max-width: 600px) {
+  /* Claude info card: stack each row's label above full-width content so
+     Agent / Skills / Worktrees / tmux / Sessions / Monitor stop getting
+     squished against the fixed 78px label column. */
+  .claude-info { padding: 12px; gap: 12px; }
+  .claude-info__row { flex-wrap: wrap; align-items: flex-start; gap: 6px 8px; }
+  .claude-info__row--worktrees,
+  .claude-info__row--monitor,
+  .claude-info__row--sessions { flex-wrap: wrap; align-items: flex-start; }
+  .claude-info__label { flex: 0 0 100%; }
+  /* Drop the inline "stop first" / "used when…" hints on phones. */
+  .claude-info__row > .claude-info__hint { display: none; }
+  .claude-info__row select { width: 100%; flex: 1 1 100%; }
+  .claude-info__value { flex: 1 1 auto; min-width: 0; }
+  .claude-info__monitor,
+  .claude-info__sessions,
+  .claude-info__worktrees { width: 100%; flex: 1 1 100%; }
+  .claude-info__wt-actions { margin-left: 0; width: 100%; }
+  .claude-info__wt-actions .btn { flex: 1 1 auto; }
+
+  /* Worktree + session rows wrap instead of overflowing. */
+  .wt-list-row { flex-wrap: wrap; gap: 6px; }
+  .wt-list-row__main { flex-wrap: wrap; gap: 6px; width: 100%; }
+  .wt-list-row__path { max-width: 100%; flex: 1 1 100%; }
+  .wt-list-row__push { margin-left: auto; }
+  .claude-session { flex-wrap: wrap; gap: 6px 8px; }
+  .claude-session__meta { flex: 1 1 100%; }
 }
 
 @media (max-width: 480px) {
