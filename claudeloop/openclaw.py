@@ -24,7 +24,7 @@ class OpenClawConfig:
     wake_mode: str = "now"
     agent_name: str = "loom"
     agent_id: str = ""
-    deliver: bool = False
+    deliver: bool = True
     channel: str = ""
     to: str = ""
 
@@ -106,7 +106,7 @@ def build_openclaw_config(
         wake_mode=cfg_wake_mode,
         agent_name=str(agent_name or data.get("agent_name", data.get("name", "loom"))),
         agent_id=str(agent_id or data.get("agent_id", data.get("agentId", ""))),
-        deliver=bool(deliver if deliver is not None else data.get("deliver", False)),
+        deliver=bool(deliver if deliver is not None else data.get("deliver", True)),
         channel=str(channel or data.get("channel", "")),
         to=str(to or data.get("to", "")),
     )
@@ -130,7 +130,7 @@ def config_from_environment() -> OpenClawConfig:
         wake_mode=os.environ.get("CLAUDELOOP_OPENCLAW_WAKE_MODE", "now"),
         agent_name=os.environ.get("CLAUDELOOP_OPENCLAW_AGENT_NAME", "loom"),
         agent_id=os.environ.get("CLAUDELOOP_OPENCLAW_AGENT_ID", ""),
-        deliver=os.environ.get("CLAUDELOOP_OPENCLAW_DELIVER", "") == "1",
+        deliver=os.environ.get("CLAUDELOOP_OPENCLAW_DELIVER", "1") != "0",
         channel=os.environ.get("CLAUDELOOP_OPENCLAW_CHANNEL", ""),
         to=os.environ.get("CLAUDELOOP_OPENCLAW_TO", ""),
     )

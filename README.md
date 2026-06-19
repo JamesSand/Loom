@@ -6,27 +6,102 @@
 
 <p align="center"><em>You drive Claude Code / Codex — Loom keeps the worktrees, plans, diffs, and notes tidy.</em></p>
 
-**Loom** is a lightweight task console for [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-(and Codex). You give each task a goal, a deep‑interview pane refines it into a
-`PLAN.md`, you spin up git worktrees on `zhongzhu/<slug>` branches and `/goal`
-your way through the work, review the diff, and optionally get pinged whenever
-the agent stops and needs you.
+**Loom** is a small web console for driving [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+(and Codex). You give a task a goal; Loom gives it a real terminal, turns the
+goal into a `PLAN.md`, manages git worktrees, shows the diff, and pings you when
+the agent needs input. There's no autonomous loop — **you drive the agent**;
+Loom just keeps the bookkeeping tidy.
 
-There is no autonomous agent loop, no worker, and no evaluator — **you drive the
-agent**; Loom just removes the bookkeeping: worktrees, `PLAN.md`, diffs,
-sessions, project notes, and notifications.
+## Quickstart
 
-## The Loom flow
+```bash
+git clone https://github.com/FutureMLS-Lab/Loom.git && cd Loom
+pip install -e .
+
+claude                                      # log in to the agent CLI once
+loom web --project /path/to/your/project    # start the console
+# → open http://127.0.0.1:8765
+```
+
+You also need **git** and **tmux** on your PATH. That's it — you're running.
+(`loom` is the command; the old `claudeloop` name still works as an alias.)
+
+## The basic flow
+
+1. **+ Add folder** (top bar) — pick the repo you want to work in.
+2. **Create Task** — give it a title and a one-line goal.
+3. Open the task → **Start Claude**, and wait a few seconds for it to boot.
+4. **Start Deep Interview** — answer its questions; it writes **`PLAN.md`**.
+5. **Run /goal** — it works through the plan. Review in the **Changes** tab,
+   click **Write result** to log progress back to `PLAN.md`, and repeat.
 
 ```
-General goal ─▶ Start Deep Interview ─▶ Run /goal ─▶ Write result ─▶ (repeat)
-                      │                     │              │
-                 writes PLAN.md       executes PLAN.md   appends results
+Create task ─▶ Start Claude ─▶ Deep Interview ─▶ Run /goal ─▶ Write result ─▶ (repeat)
 ```
 
-These three steps are the **Loom flow** buttons in the Claude tab. You start the
-agent, let the deep interview turn your goal into `PLAN.md`, run `/goal` against
-it, and write progress/results back into `PLAN.md` — then iterate.
+When you're happy, **Push** the worktree or **Merge ↩** it from the Changes tab.
+
+<details>
+<summary><b>Full step-by-step walkthrough</b> — click to expand (worktrees, notify, resume, and the details)</summary>
+
+1. **Register your project.** Top bar → **+ Add folder**, pointed at a git repo
+   (or a container directory holding several repos). Registrations live in
+   `~/.claudeloop/web-projects.json`; nothing is written outside the path.
+
+2. **Create a task.** **Create Task** asks for a **type** (Claude, Codex, Kernel
+   Lab, or ARIS), a **title** (becomes the slug), and a **general goal**. Loom
+   creates `.RUD/<slug>/` with an empty `PLAN.md`; if the project root is a git
+   repo it auto-creates a worktree at `.RUD/<slug>/work/<repo>/` on branch
+   `zhongzhu/<slug>`.
+
+3. **Start the agent.** Task → **Claude** tab → **Start Claude** launches a tmux
+   pane running the agent CLI in the task's `work/` worktree. The pane keeps
+   running even if you close the browser.
+
+4. **Run the deep interview.** **Start Deep Interview** pastes a prompt (your
+   goal + selected skills); the agent interviews you and writes the agreed plan
+   to `PLAN.md`. Answer in the terminal (real terminal: type, ↑/↓ to pick, Enter).
+
+5. **Review the plan** in the embedded read-only viewer (defaults to `PLAN.md`).
+
+6. **Execute it** with **Run /goal**; answer any prompts right in the terminal.
+
+7. **Review the changes** in the **Changes** tab (uncommitted + committed diff);
+   optionally **Review ⚖** for an AI review against your rules / skills.
+
+8. **Write the result** with **Write result** to append progress to `PLAN.md`,
+   then iterate (repeat 6–8).
+
+9. **Ship it.** Loom never auto-commits — the agent commits in the worktree (or
+   you do); then **Push** the worktree, or **Merge ↩** its branch back into the
+   base branch from the Changes tab.
+
+10. **(Optional) Notify.** Flip **Notify** on the Monitor row so Loom pings you
+    (e.g. in Slack via OpenClaw) when the agent stops and waits for input; your
+    reply is typed straight back into the pane.
+
+11. **(Later) Resume.** Pick a past session from the **Sessions** dropdown →
+    **Resume** to reopen it in a fresh tmux pane, even if the original was killed.
+
+</details>
+
+## Run options
+
+| Flag | Purpose |
+|------|---------|
+| `--project PATH` | Project root. Defaults to `$PWD`. A git repo OR a container directory holding several git repos. |
+| `--skills PATH` | Default skills markdown injected into every agent session. Defaults to `claudeloop/skills/charlie_skills.md`. |
+| `--projects` | Multi-project workspace: the launch dir is a container of repos. |
+| `--auth-token TOKEN` | Require auth (HTTP basic / bearer; username ignored, password = token). Also reads `CLAUDELOOP_WEB_AUTH_TOKEN`. |
+| `--daemon` / `--nohup` | Run in the background. Logs land in `<project>/.RUD/web.log`. |
+| `--openclaw …` | Optional [OpenClaw](#openclaw-integration) notifications + reply-back (full flags in `claudeloop/cli.py`). |
+
+```bash
+loom init    # writes a minimal PLAN.md + NOTES.md in $PWD
+loom --help  # all commands
+```
+
+## Layout on disk
 
 ```
 ┌─ Project root (e.g. ~/work/xorl) ──────────────────────────────────┐
@@ -38,165 +113,68 @@ it, and write progress/results back into `PLAN.md` — then iterate.
 │     ├── PLAN.md         ← the deep interview writes this; you edit  │
 │     ├── monitor.json    ← run-monitor on/off + last-fired (if used) │
 │     └── work/                                                       │
-│         ├── xorl-internal/   ← git worktree, branch zhongzhu/<slug> │
-│         └── xorl-sglang/     ← second worktree, same branch name    │
+│         └── <repo>/     ← git worktree, branch zhongzhu/<slug>      │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-(`.RUD/` is Loom's per-project task directory.)
+(`.RUD/` is Loom's per-project task directory. The agent pane opens in `work/`.)
 
-## Install
+## Web UI reference
 
-```bash
-git clone https://github.com/FutureMLS-Lab/Loom.git
-cd Loom
-pip install -e .
+An agent task has two main tabs — **Claude** (or **Codex**) and **Changes** — plus
+a read-only Markdown viewer (Kernel Lab tasks get their own panel). Every control:
 
-# Authenticate the agent CLI used by the pane (Claude Code shown here).
-claude
-```
+| Where | Control | What it does |
+|-------|---------|--------------|
+| **Claude tab** | **Start / Stop Claude** | Launch / kill the tmux pane (agent CLI in the primary `work/` worktree). Stopping keeps sessions resumable. |
+| | **Loom flow** | Three buttons — **Start Deep Interview** → **Run /goal** → **Write result** (each pastes a prompt; run any, anytime). |
+| | **Terminal** | Real xterm.js on the live PTY: type, arrows, Enter, Esc, Ctrl-C, paste all go to the agent; mouse-wheel scrolls history. |
+| | **中文 / compose box** | Type Chinese (input-method-safe) or long text → **Enter** sends it into the pane. |
+| | **Copy / paste** | Copy: select + **Cmd/Ctrl+C** (or Ctrl+Shift+C). Paste: **Cmd/Ctrl+V** (or Ctrl+Shift+V). |
+| | **Agent** | Switch Claude ⇄ Codex (while stopped). New Claude tasks default to `claude-opus-4-8`. |
+| | **Skills** | Which skills markdown to inject (files under the skills dir). |
+| | **Worktrees** | Dropdown of the task's worktrees + live `git status`; **Push** (selected), **×** remove, **+ Add worktree**, **Push all**. |
+| | **tmux** | The live pane target + an alive/down pill. |
+| | **Sessions** | Dropdown of past agent sessions (newest first) + **Resume** — reopens it in a fresh pane, even if the tmux was killed. |
+| | **Monitor** | **Notify** toggle → pings you (OpenClaw/Slack) when the agent stops; your reply is typed back into the pane. |
+| | **Markdown viewer** | Read-only preview of `PLAN.md` (or any top-level `*.md`). The agent writes PLAN.md; you `/goal` it in the pane. |
+| **Changes tab** | **Diff** | Read-only VSCode-style diff: uncommitted (vs `HEAD`, incl. untracked) + committed (vs base, e.g. `origin/main`). |
+| | **Merge ↩** | Merge the worktree's branch into the base — `git merge --no-ff`; refuses if dirty, aborts on conflicts, never pushes. |
+| | **Review ⚖** | AI review (`claude -p`) of the diff vs your rules (toolbar box) or the task's skills. |
+| **Top bar** | **+ Add folder** | Register a repo from the Loom launch directory. |
+| | **📓 Notes** | Fullscreen editor for `<project>/.RUD/NOTES.md` (one per project). **Cmd/Ctrl+S** saves. |
 
-Optional but needed for the live agent pane:
+**Run monitor (Notify):** edge-triggers on *running → stopped* — when the agent was
+working (pane shows "esc to interrupt") then stops for input, Loom sends an OpenClaw
+event with the tail of the pane; your reply is typed back in and you're pinged again
+on the next stop. (Enabled while the pane is idle, it stays quiet until the agent
+next runs and stops.)
 
-```bash
-tmux -V       # tmux must be on PATH
-git --version
-```
+### Task types
 
-This installs the `loom` command (the legacy `claudeloop` command remains as an
-alias). The Python module is importable as `claudeloop`.
-
-## Run
-
-From any directory:
-
-```bash
-loom web --project /path/to/your/project --port 8765
-# open http://127.0.0.1:8765/
-```
-
-Useful flags:
-
-| Flag | Purpose |
-|------|---------|
-| `--project PATH` | Project root. Defaults to `$PWD`. Can be a git repo OR a container directory holding several git repos. |
-| `--skills PATH` | Default skills markdown injected into every agent session. Defaults to `claudeloop/skills/charlie_skills.md`. The per-task Skills picker only lists markdown under the skills directory. |
-| `--projects` | Multi-project workspace: the launch dir is a container; the parent registry entry is pruned once children are registered. |
-| `--auth-token TOKEN` | Require HTTP basic / bearer auth. Username is ignored; password = token. Also reads `CLAUDELOOP_WEB_AUTH_TOKEN`. |
-| `--daemon` / `--nohup` | Re-spawn in the background and exit. Logs land in `<project>/.RUD/web.log`. |
-| `--openclaw …` | Optional [OpenClaw](#openclaw-integration) gateway events (run-monitor notifications + reply-back). Full flag list in `claudeloop/cli.py`. |
-
-```bash
-loom init    # writes a minimal PLAN.md + NOTES.md in $PWD
-loom --help  # all commands
-```
-
-## Web UI
-
-### 1. Register a project
-
-Use **+ Add repo** in the top bar. Registrations are stored in
-`~/.claudeloop/web-projects.json` (no files are written outside the registered
-path). If the launch directory is a container, pick from the subfolder chips.
-
-### 2. Create a task
-
-**Create Task** asks for:
-
-- **Task type** — Claude, Codex, or Kernel Lab (a dropdown).
-- **Title** — becomes the slug (lowercased, dash-separated).
-- **General goal** — a short description the deep interview turns into `PLAN.md`.
-
-A `.RUD/<slug>/` directory is created with an empty `PLAN.md`. If the project
-root is itself a git repo, **one worktree is auto-created** at
-`.RUD/<slug>/work/<repo-name>/` on branch `zhongzhu/<slug>`. Container projects
-(no `.git` of their own) skip auto-creation — you pick the source repo from the
-Claude tab. The default model is `claude-opus-4-8` for Claude tasks.
-
-Click the title or goal in the task header to rename / re-goal at any time.
-
-### 3. The Claude (or Codex) tab
-
-The main tab for an agent task contains:
-
-- **Loom flow row** — `Start Deep Interview → Run /goal → Write result`, with
-  Start / Stop Claude above it.
-- **Info card** with:
-  - **Agent** — Claude or Codex (switch while stopped).
-  - **Skills** — which skills markdown to inject (only files under the skills
-    directory are listed).
-  - **Worktrees** — every git worktree owned by the task, with branch, live
-    `git status` (clean / N modified / ↑3 ↓2), a per-row **Push**, **+ Add
-    worktree** (candidate picker; already-added ones dimmed), **Push all**, and
-    a `×` to remove (`git worktree remove`).
-  - **tmux** — the live pane target + alive/down pill.
-  - **Sessions** — every agent session UUID the pane has spawned (scanned from
-    `~/.claude/projects/<encoded-cwd>/` or the Codex equivalent). **Resume**
-    launches a fresh tmux pane with `--resume <uuid>`, even if the original
-    tmux was killed.
-  - **Monitor** — a Notify toggle (see [OpenClaw integration](#openclaw-integration)).
-- **Live tmux pane** preview (polls every ~4s, auto-scrolls to the bottom) with
-  a keycap row (↑ ↓ ← → Enter Esc Ctrl-C) next to the input.
-- **Embedded read-only Markdown viewer** — defaults to `PLAN.md`, with a picker
-  for any other top-level `*.md` in the task directory.
-
-Starting the pane runs `tmux new-session` + the agent CLI in the **primary**
-worktree (first in the worktrees list). **Start Deep Interview** then pastes a
-prompt (general goal + selected skills) that interviews you and writes `PLAN.md`.
-
-### 4. The Changes tab
-
-A read-only, VSCode-style git diff for the task's worktree(s): a file list (with
-add/remove counts and A/M/D/R status) on the left and a red/green unified diff on
-the right. It shows both **uncommitted** changes (working tree vs `HEAD`,
-including untracked files) and **committed** work (vs the detected base branch,
-e.g. `origin/main`). Refreshes on tab open and via the Refresh button.
-
-### 5. Run monitor + OpenClaw
-
-Flip **Notify** on the Monitor row to have Loom watch the agent's tmux pane. It
-edge-triggers on the **running → stopped** transition: when the agent was
-working (the pane shows its “esc to interrupt” hint) and then stops to wait for
-input, Loom emits an OpenClaw event with the last lines of the pane for context.
-Reply in OpenClaw and it is pushed back into the pane
-(`POST /api/tasks/<slug>/claude/send`), the agent runs again, and you're pinged
-on the next stop — repeat. If the pane is already idle when you enable Notify,
-it stays silent until the agent actually runs and then stops.
-
-See [OpenClaw integration](#openclaw-integration) for setup.
-
-### 6. PLAN.md & Notes
-
-- The embedded viewer is read-only; the agent writes `PLAN.md` during the
-  interview and you edit/`/goal` it inside the pane.
-- The **📓 Notes** button opens a fullscreen editor for
-  `<project>/.RUD/NOTES.md` — one project-scoped scratchpad. **Cmd/Ctrl + S**
-  saves.
-
-### 7. Kernel Lab (optional)
-
-Kernel-optimization tasks get a dedicated panel that drives the TKCC kernel
-evaluator: a persistent interview to produce a kernel spec, worktree management,
-and a build/run launcher with a live log. This is an advanced, optional task
-type; regular Claude/Codex tasks don't need it.
+| Type | What it is |
+|------|------------|
+| **Claude / Codex** | The standard human-driven flow above. |
+| **ARIS** | Autonomous-research loop — mines ideas from the codebase, spins up a worktree per experiment, folds results into `PLAN.md` (skill: `claudeloop/skills/aris/ARIS.md`). |
+| **Kernel Lab** | Dedicated panel driving the TKCC kernel evaluator (spec interview + build/run launcher with live log). Advanced / optional. |
 
 ## OpenClaw integration
 
-Loom can push events to an OpenClaw gateway. The headline use is the **run
-monitor**: you get pinged (e.g. in Slack) whenever an agent stops and is waiting
-for input, and your reply is sent straight back into its pane.
+Loom can push events to an OpenClaw gateway. The headline
+use is the **run monitor**: you get pinged (e.g. in Slack) whenever an agent
+stops and is waiting for input, and your reply is sent straight back into its
+pane.
 
 ### Enable it
 
-Launch Loom with the OpenClaw flags. Use the **`/hooks/agent`** endpoint with
-`--openclaw-deliver` so messages are actually delivered — the lighter
-`/hooks/wake` endpoint only *wakes* an agent and does not post a message:
+Launch Loom pointing at the **`/hooks/agent`** endpoint — message **delivery is
+on by default**. (The lighter `/hooks/wake` endpoint only *wakes* the gateway
+and does **not** post a message, so use `/hooks/agent`.)
 
 ```bash
 loom web --project /path/to/project \
   --openclaw \
   --openclaw-url http://127.0.0.1:18789/hooks/agent \
-  --openclaw-deliver \
   --openclaw-token <gateway-token> \
   --openclaw-debug            # logs each POST + HTTP status
 ```
@@ -289,14 +267,18 @@ Everything is plain JSON; scope with `?project=<id>` (or the
 | `GET` | `/api/tasks/<slug>/worktree-candidates` | Repos you could base a worktree on |
 | `POST` / `DELETE` | `/api/tasks/<slug>/worktree` | Create / remove a worktree |
 | `POST` | `/api/tasks/<slug>/worktree/push` `{path}` | `git push -u origin <branch>` |
+| `POST` | `/api/tasks/<slug>/worktree/merge` `{path}` | Merge the worktree branch into the base branch (no push) |
 | `POST` | `/api/tasks/<slug>/worktrees/push-all` | Push every task worktree branch |
+| `POST` | `/api/tasks/<slug>/review` `{path, rules?}` | AI review of the worktree diff vs rules / skills |
 | `POST` | `/api/tasks/<slug>/claude/start` | Launch the agent pane in the primary worktree |
 | `POST` | `/api/tasks/<slug>/claude/stop` | Kill the tmux pane (on-disk sessions stay resumable) |
 | `POST` | `/api/tasks/<slug>/claude/paste-prompt` | Re-paste the deep-interview prompt |
 | `POST` | `/api/tasks/<slug>/claude/resume` `{session_id}` | New tmux, `--resume <id>` |
 | `GET` | `/api/tasks/<slug>/claude-sessions` | Tracked session UUIDs + on-disk transcripts |
-| `GET` | `/api/tmux/capture?target=…&lines=N` | Pane scrollback |
-| `POST` | `/api/tmux/send-text` / `send-key` | Type / send a key into a pane |
+| `GET` | `/api/tmux/stream?target=…&cols=N&rows=N` | Live PTY byte stream for the xterm terminal |
+| `GET` | `/api/tmux/capture?target=…&lines=N` | Pane scrollback snapshot (used by the monitor) |
+| `POST` | `/api/tmux/send-literal` `{target, text}` | Send raw keystrokes/bytes (used by the terminal) |
+| `POST` | `/api/tmux/send-text` / `send-key` | Type text / send a named key into a pane |
 
 Kernel Lab adds `/api/kernel/*` endpoints. For backwards compatibility,
 `/api/tasks/<slug>/interview/{start,stop,paste-prompt}` still resolves to the

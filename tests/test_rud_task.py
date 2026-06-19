@@ -763,3 +763,15 @@ def test_create_task_aris_kind(tmp_path: Path) -> None:
     assert meta.kind == "aris"
     reloaded = read_meta(tmp_path, meta.slug)
     assert reloaded is not None and reloaded.kind == "aris"
+
+
+def test_read_meta_upgrades_legacy_default_model(tmp_path: Path) -> None:
+    """Tasks created when the default was claude-sonnet-4-6 should resume on the
+    current default (opus), since the model is never an explicit UI choice."""
+    import json as _json
+    meta = create_task(tmp_path, "old task", "g", skills_path=None, auto_worktree=False)
+    tj = task_root(tmp_path, meta.slug) / "task.json"
+    data = _json.loads(tj.read_text())
+    data["interview_model"] = "claude-sonnet-4-6"
+    tj.write_text(_json.dumps(data, indent=2))
+    assert read_meta(tmp_path, meta.slug).interview_model == "claude-opus-4-8"

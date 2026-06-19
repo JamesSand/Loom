@@ -18,11 +18,22 @@ _KEYS = {
     "Left",
     "Right",
     "Escape",
-    "C-c",
-    "C-d",
     "Tab",
+    "BTab",
     "Backspace",
+    "BSpace",
+    "Space",
+    "Home",
+    "End",
+    "DC",
+    "IC",
+    "PageUp",
+    "PageDown",
 }
+# Also accept Ctrl-/Alt-<letter> combos and function keys. These are validated
+# against a strict pattern and passed as a single argv (never via a shell), so
+# they can't smuggle options or shell metacharacters.
+_KEY_RE = re.compile(r"^(?:[CM]-[A-Za-z]|F[0-9]{1,2})$")
 
 
 def tmux_subprocess_env() -> dict[str, str]:
@@ -179,7 +190,7 @@ def send_pane_key(target: str, key: str) -> tuple[bool, str]:
     k = key.strip()
     if not _TARGET_RE.match(t):
         return False, "invalid pane target (expected session:window.pane)"
-    if k not in _KEYS:
+    if k not in _KEYS and not _KEY_RE.match(k):
         return False, f"unsupported key: {k}"
     try:
         r = subprocess.run(
@@ -196,6 +207,171 @@ def send_pane_key(target: str, key: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _exit_copy_mode_if_active(t: str, env: dict) -> None:
+    """Leave tmux copy-mode if the pane is in it, so subsequent input reaches
+    the running program. While scrolled up (copy-mode), tmux otherwise consumes
+    every keystroke (arrows move the copy cursor, symbols/typing do nothing)."""
+    try:
+        chk = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", t, "#{pane_in_mode}"],
+            capture_output=True, text=True, env=env, timeout=5,
+        )
+        if chk.returncode == 0 and chk.stdout.strip() == "1":
+            subprocess.run(
+                ["tmux", "send-keys", "-t", t, "-X", "cancel"],
+                capture_output=True, text=True, env=env, timeout=5,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def send_pane_literal(target: str, text: str) -> tuple[bool, str]:
+    """Send literal text to a pane fast via ``tmux send-keys -l`` (no Enter).
+
+    Used by the native-terminal keystroke forwarding so each typed character (or
+    a short burst of them) reaches the pane immediately, without the heavier
+    load-buffer/paste path that ``send_pane_text`` uses for big blocks.
+    """
+    import shutil
+
+    if not shutil.which("tmux"):
+        return False, "tmux not on PATH"
+    t = target.strip()
+    if not _TARGET_RE.match(t):
+        return False, "invalid pane target (expected session:window.pane)"
+    if not isinstance(text, str):
+        return False, "text must be a string"
+    if text == "":
+        return True, ""
+    if len(text) > 10000:
+        return False, "text too long"
+    env = tmux_subprocess_env()
+    # If the user scrolled up (copy-mode), leave it so typing reaches the program.
+    _exit_copy_mode_if_active(t, env)
+    try:
+        r = subprocess.run(
+            ["tmux", "send-keys", "-t", t, "-l", "--", text],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "send-literal failed").strip()
+    return True, ""
+
+
+def open_pane_attach(target: str, cols: int = 80, rows: int = 24):
+    """Open a PTY running ``tmux attach-session`` to *target*, sized cols x rows.
+
+    Returns ``(proc, master_fd)`` on success or ``(None, None)`` on failure. The
+    caller reads ``master_fd`` (the live terminal byte stream for xterm.js),
+    then must ``proc.terminate()`` and ``os.close(master_fd)`` when done. Input
+    is delivered separately via ``send_pane_literal`` / ``send_pane_key``.
+    """
+    import pty
+    import struct
+    import fcntl
+    import termios
+    import shutil
+
+    if not shutil.which("tmux"):
+        return None, None
+    t = target.strip()
+    if not _TARGET_RE.match(t):
+        return None, None
+    try:
+        cols = max(20, min(500, int(cols)))
+        rows = max(5, min(300, int(rows)))
+    except (TypeError, ValueError):
+        cols, rows = 80, 24
+    env = tmux_subprocess_env()
+    env["TERM"] = "xterm-256color"
+    try:
+        master, slave = pty.openpty()
+    except OSError:
+        return None, None
+    try:
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except OSError:
+        pass
+    try:
+        proc = subprocess.Popen(
+            ["tmux", "attach-session", "-t", t],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            start_new_session=True,
+            env=env,
+        )
+    except OSError:
+        os.close(master)
+        os.close(slave)
+        return None, None
+    os.close(slave)
+    # Make the tmux window match this browser client exactly so the pane is never
+    # wider than the xterm view (which is what forced sideways scrolling). Agent
+    # sessions are created at a fixed size, so without this the window can stay
+    # wider than the phone/narrow browser. `resize-window` pins the window to our
+    # cols x rows (and flips it to manual sizing); if that's unavailable, fall
+    # back to window-size=latest so the window at least follows this client.
+    win_target = t.rsplit(".", 1)[0] if "." in t else t
+    resized = False
+    try:
+        r = subprocess.run(
+            ["tmux", "resize-window", "-t", win_target, "-x", str(cols), "-y", str(rows)],
+            capture_output=True, text=True, env=env, timeout=5,
+        )
+        resized = r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        resized = False
+    if not resized:
+        try:
+            subprocess.run(
+                ["tmux", "set-option", "-t", t.split(":")[0], "window-size", "latest"],
+                capture_output=True, text=True, env=env, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return proc, master
+
+
+def scroll_pane(target: str, direction: str = "up", lines: int = 3) -> tuple[bool, str]:
+    """Scroll a pane's tmux history via copy-mode (what ``Ctrl-b [`` does).
+
+    Lets the web terminal's mouse/touchpad wheel browse scrollback instead of
+    xterm converting the wheel into arrow keys for the full-screen app. Entering
+    ``copy-mode -e`` is idempotent and auto-exits when the user scrolls back to
+    the bottom, so live output resumes on its own.
+    """
+    import shutil
+
+    if not shutil.which("tmux"):
+        return False, "tmux not on PATH"
+    t = target.strip()
+    if not _TARGET_RE.match(t):
+        return False, "invalid pane target (expected session:window.pane)"
+    try:
+        n = max(1, min(500, int(lines)))
+    except (TypeError, ValueError):
+        n = 3
+    env = tmux_subprocess_env()
+    if direction == "down":
+        cmd = ["tmux", "send-keys", "-t", t, "-X", "-N", str(n), "scroll-down"]
+    else:
+        cmd = [
+            "tmux", "copy-mode", "-e", "-t", t, ";",
+            "send-keys", "-t", t, "-X", "-N", str(n), "scroll-up",
+        ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    return (r.returncode == 0), (r.stderr or "").strip()
+
+
 def send_pane_text(target: str, text: str, submit: bool = False) -> tuple[bool, str]:
     """Paste text into a tmux pane via buffer; optionally submit with Enter."""
     import shutil
@@ -207,6 +383,8 @@ def send_pane_text(target: str, text: str, submit: bool = False) -> tuple[bool, 
         return False, "invalid pane target (expected session:window.pane)"
     if not isinstance(text, str):
         return False, "text must be a string"
+    # Leave copy-mode first so the paste lands in the program, not copy-mode.
+    _exit_copy_mode_if_active(t, tmux_subprocess_env())
     buffer_name = f"claudeloop-web-{uuid.uuid4().hex}"
     tmp_path = ""
     try:

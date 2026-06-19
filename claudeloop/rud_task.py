@@ -71,6 +71,19 @@ def agent_default_model(name: str) -> str:
     }.get(normalize_agent(name), "")
 
 
+# Model strings that were a previous global default and are not selectable via
+# any UI - so they are vestigial, never an intentional per-task choice. Treat
+# them as "use the current default" so old tasks start/resume on the new model.
+_LEGACY_DEFAULT_MODELS = {"claude-sonnet-4-6"}
+
+
+def _upgrade_legacy_model(model: str, agent: str = AGENT_CLAUDE) -> str:
+    m = (model or "").strip()
+    if m in _LEGACY_DEFAULT_MODELS:
+        return agent_default_model(agent) or m
+    return m
+
+
 def build_agent_command(
     agent: str,
     model: str = "",
@@ -390,7 +403,10 @@ class TaskMeta:
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             skills_path=str(data.get("skills_path", "")),
-            interview_model=str(data.get("interview_model", "claude-opus-4-8")),
+            interview_model=_upgrade_legacy_model(
+                str(data.get("interview_model", "claude-opus-4-8")),
+                normalize_agent(data.get("agent")),
+            ),
             tmux_interview_target=str(data.get("tmux_interview_target", "")),
             agent=normalize_agent(data.get("agent")),
             kind=str(data.get("kind", "agent") or "agent"),
@@ -1723,6 +1739,100 @@ def push_worktree_branch(wt: Path) -> dict[str, Any]:
         "branch": branch,
         "message": text or ("pushed" if ok_push else "push failed"),
         "error": "" if ok_push else (text or "push failed"),
+    }
+
+
+def merge_worktree_to_base(wt: Path) -> dict[str, Any]:
+    """Merge a worktree's branch back into the source repo's checked-out branch.
+
+    Runs ``git merge --no-ff <wt-branch>`` inside the *source* repo (the main
+    working tree this worktree was created from). Safety:
+    - refuses if the source working tree is dirty (won't clobber your work),
+    - aborts the merge on conflict and reports the conflicting files,
+    - does NOT push (the merge stays local, so it's easy to review or reset).
+    """
+    try:
+        wt = wt.resolve()
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    if not wt.is_dir():
+        return {"ok": False, "error": "worktree not found"}
+    ok, branch, _ = _git(["branch", "--show-current"], wt, timeout=10)
+    branch = branch.strip()
+    if not ok or not branch:
+        return {"ok": False, "error": "worktree has no current branch"}
+    ok, common, _ = _git(["rev-parse", "--git-common-dir"], wt, timeout=10)
+    if not ok or not common:
+        return {"ok": False, "error": "could not resolve the source repo"}
+    cp = Path(common)
+    if not cp.is_absolute():
+        cp = wt / cp
+    try:
+        source = cp.resolve().parent
+    except OSError:
+        source = cp.parent
+    if not source.is_dir():
+        return {"ok": False, "error": f"source repo not found at {source}"}
+    ok, base, _ = _git(["branch", "--show-current"], source, timeout=10)
+    base = base.strip()
+    if not base:
+        return {
+            "ok": False,
+            "error": "source repo is in a detached HEAD - checkout a base branch first",
+            "source": str(source),
+        }
+    if base == branch:
+        return {
+            "ok": False,
+            "error": f"source repo is already on {branch}; nothing to merge",
+            "base": base,
+            "branch": branch,
+        }
+    _ok, dirty, _ = _git(["status", "--porcelain"], source, timeout=15)
+    # Only block on uncommitted changes to *tracked* files (a merge could
+    # clobber them). Untracked files - notably the project's own ``.RUD/``
+    # task dir living inside a self-repo - must not block the merge; git's
+    # own merge still aborts if an untracked file would be overwritten.
+    tracked_dirty = [
+        ln for ln in dirty.splitlines() if ln.strip() and not ln.startswith("??")
+    ]
+    if tracked_dirty:
+        return {
+            "ok": False,
+            "base": base,
+            "branch": branch,
+            "source": str(source),
+            "error": (
+                f"source repo ({source}) has uncommitted changes to tracked "
+                "files; commit or stash them before merging"
+            ),
+        }
+    ok_m, out, err = _git(["merge", "--no-ff", branch], source, timeout=120)
+    text = "\n".join(x for x in (out, err) if x).strip()
+    if ok_m:
+        return {
+            "ok": True,
+            "base": base,
+            "branch": branch,
+            "source": str(source),
+            "message": text or f"merged {branch} into {base}",
+        }
+    # Conflict / failure: abort so the source tree is left clean.
+    _ok2, conflicts, _ = _git(
+        ["diff", "--name-only", "--diff-filter=U"], source, timeout=15
+    )
+    _git(["merge", "--abort"], source, timeout=30)
+    return {
+        "ok": False,
+        "base": base,
+        "branch": branch,
+        "source": str(source),
+        "error": (
+            "merge hit conflicts (aborted, source left clean) - resolve them "
+            "manually or ask the agent to merge"
+        ),
+        "conflicts": [c for c in conflicts.splitlines() if c.strip()],
+        "detail": text,
     }
 
 

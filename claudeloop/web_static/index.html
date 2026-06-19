@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Loom</title>
   <link rel="icon" type="image/png" href="/static/loom-logo.png" />
-  <link rel="stylesheet" href="/static/app.css?v=20260616-1" />
+  <link rel="stylesheet" href="/static/vendor/xterm.css?v=5.5.0" />
+  <link rel="stylesheet" href="/static/app.css?v=20260618-24" />
 </head>
 <body>
   <header class="topbar">
@@ -38,20 +39,11 @@
   <nav class="project-bar" aria-label="Registered repositories">
     <span class="project-bar__hint" id="project-bar-hint">Projects</span>
     <div class="project-bar__scroll" id="project-toggle-scroll" role="tablist" aria-label="Switch project"></div>
-    <button type="button" class="project-bar__add" id="btn-add-project">+ Add repo</button>
+    <button type="button" class="project-bar__add" id="btn-add-project">+ Add folder</button>
   </nav>
 
   <div class="layout">
     <aside class="sidebar">
-      <section class="sidebar__section">
-        <div class="sidebar__heading-row">
-          <h2 class="sidebar__heading">tmux</h2>
-          <button type="button" class="btn btn--ghost btn--sm" id="btn-tmux-refresh">Refresh</button>
-        </div>
-        <p class="sidebar__hint">Loom agent sessions for the <strong>selected</strong> project.</p>
-        <ul class="tmux-list" id="tmux-sessions"></ul>
-      </section>
-
       <section class="sidebar__section">
         <div class="sidebar__heading-row">
           <h2 class="sidebar__heading">Tasks <span class="sidebar__count" id="task-count"></span></h2>
@@ -91,14 +83,12 @@
             <button type="button" class="btn btn--danger" id="btn-interview-stop">Stop Claude</button>
             <span class="action-hint">Worktree and session info below; the tmux pane lives even if you close the browser.</span>
           </div>
-          <div class="rud-flow-row" aria-label="Loom workflow shortcuts">
-            <span class="rud-flow-row__label">Loom flow</span>
-            <button type="button" class="btn btn--primary btn--sm rud-flow-row__step" id="btn-interview-paste">Start Deep Interview</button>
-            <span class="rud-flow-row__arrow" aria-hidden="true">→</span>
+          <div class="rud-flow-row" aria-label="Loom prompt shortcuts">
+            <span class="rud-flow-row__label">Prompts</span>
+            <button type="button" class="btn btn--sm rud-flow-row__step" id="btn-interview-paste">Start Deep Interview</button>
             <button type="button" class="btn btn--sm rud-flow-row__step" id="btn-run-goal">Run /goal</button>
-            <span class="rud-flow-row__arrow" aria-hidden="true">→</span>
             <button type="button" class="btn btn--sm rud-flow-row__step" id="btn-write-result">Write result</button>
-            <span class="rud-flow-row__hint">Deep interview writes PLAN.md → /goal executes it → results go back to PLAN.md</span>
+            <span class="rud-flow-row__hint">Each just pastes a prompt into the Claude pane — run any of them, anytime.</span>
           </div>
           <div class="pane-card claude-info" id="claude-info-card">
             <div class="claude-info__row">
@@ -148,32 +138,32 @@
             <div class="terminal-card__bar">
               <span class="terminal-card__bar-glyph" aria-hidden="true"></span>
               <h4>Claude Terminal</h4>
+              <div class="terminal-card__bar-right">
+                <span class="terminal-card__live" id="interview-live" hidden>● live</span>
+                <button type="button" class="term-compose-toggle" id="term-compose-toggle" aria-expanded="false" aria-controls="term-compose" title="中文 / 长文本输入（输入法可靠；Enter 发送，Shift+Enter 换行）">
+                  <span class="term-compose-toggle__glyph" aria-hidden="true">中</span>
+                  <span class="term-compose-toggle__label">中文输入</span>
+                </button>
+              </div>
             </div>
-            <pre class="pre-panel pre-panel--interview" id="interview-out">Click Start Claude to launch a tmux pane in the worktree.</pre>
-          </div>
-          <textarea id="interview-in" rows="3" class="pane-input" placeholder="Answer the deep-interview questions..."></textarea>
-          <div class="pane-actions" data-pane="interview">
-            <button type="button" class="key key--send" id="btn-interview-send" title="Send and submit">
-              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false"><path d="M3.4 20.4 21.85 12 3.4 3.6l.01 7.07L17 12 3.41 13.33z" fill="currentColor"/></svg>
-              <span class="key__label">Send + Enter</span>
-            </button>
-            <span class="pane-actions__divider" aria-hidden="true"></span>
-            <button type="button" class="key" data-key="Enter" title="Enter">
-              <span class="key__icon">⏎</span><span class="key__label">Enter</span>
-            </button>
-            <div class="key-cluster" role="group" aria-label="Arrow keys">
-              <button type="button" class="key key--arrow" data-key="Up" aria-label="Up arrow">↑</button>
-              <button type="button" class="key key--arrow" data-key="Down" aria-label="Down arrow">↓</button>
-              <button type="button" class="key key--arrow" data-key="Left" aria-label="Left arrow">←</button>
-              <button type="button" class="key key--arrow" data-key="Right" aria-label="Right arrow">→</button>
+            <div id="interview-term" class="xterm-host" aria-label="Claude terminal — click and type like a real terminal"></div>
+            <div class="term-compose" id="term-compose" hidden>
+              <textarea id="term-compose-input" class="term-compose__input" rows="1" placeholder="Type a message — Enter to send, Shift+Enter for newline" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+              <button type="button" class="term-compose__send" id="term-compose-send" title="发送到终端 (Enter)">
+                <svg class="term-compose__send-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M3.32 20.4l17.4-7.46a1.02 1.02 0 0 0 0-1.88L3.32 3.6A1.01 1.01 0 0 0 1.93 4.8L4 11l9 1-9 1-2.07 6.2a1.01 1.01 0 0 0 1.39 1.2z"/></svg>
+                <span class="term-compose__send-label">Send</span>
+              </button>
             </div>
-            <button type="button" class="key" data-key="Escape" title="Escape">
-              <span class="key__icon">⎋</span><span class="key__label">Esc</span>
-            </button>
-            <button type="button" class="key key--danger" data-key="C-c" title="Ctrl + C (interrupt)">
-              <span class="key__icon">⌃C</span>
-            </button>
-            <span class="pane-actions__hint">Enter inserts a newline. Click Send + Enter to submit; Claude uses effort=max.</span>
+            <div class="term-mobile-keys" id="term-mobile-keys" aria-label="Terminal keys">
+              <button type="button" class="term-key" data-key="esc">Esc</button>
+              <button type="button" class="term-key" data-key="c-c">⌃C</button>
+              <button type="button" class="term-key" data-key="up" aria-label="Up">↑</button>
+              <button type="button" class="term-key" data-key="down" aria-label="Down">↓</button>
+              <button type="button" class="term-key" data-key="left" aria-label="Left">←</button>
+              <button type="button" class="term-key" data-key="right" aria-label="Right">→</button>
+              <button type="button" class="term-key" data-key="tab">Tab</button>
+              <button type="button" class="term-key" data-key="enter">⏎</button>
+            </div>
           </div>
           <div class="interview-markdown">
             <div class="interview-md-bar">
@@ -198,6 +188,7 @@
           <p class="tab-panel__hint">Read-only diff of this task's worktree(s): uncommitted edits plus commits ahead of the base branch.</p>
           <div class="changes-toolbar">
             <button type="button" class="btn btn--sm" id="btn-changes-refresh">Refresh</button>
+            <input type="text" id="changes-rules" class="changes-rules" spellcheck="false" placeholder="Review rules (optional, plain English) — defaults to the task's skills" />
             <span class="tab-panel__hint" id="changes-status"></span>
           </div>
           <div id="changes-body" class="changes-body"></div>
@@ -231,8 +222,11 @@
               <select id="kernel-plugin"></select>
               <label for="kernel-target">Target</label>
               <select id="kernel-target"></select>
-              <label for="kernel-shape">Shape (JSON)</label>
-              <textarea id="kernel-shape" rows="5" spellcheck="false"></textarea>
+              <details class="kernel-advanced" id="kernel-advanced-shape">
+                <summary class="kernel-advanced__summary">Advanced: override shape (JSON)</summary>
+                <p class="kernel-advanced__hint">Leave blank — the agent picks a representative shape at launch and the evaluator benchmarks it. Set this only to pin a specific shape.</p>
+                <textarea id="kernel-shape" rows="5" spellcheck="false" placeholder="(agent decides — optional override)"></textarea>
+              </details>
               <label for="kernel-model">Model</label>
               <input type="text" id="kernel-model" list="kernel-model-list" placeholder="claude-…" />
               <datalist id="kernel-model-list"></datalist>
@@ -312,8 +306,8 @@
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="add-project-modal-title">
       <div class="modal-card__header">
         <div>
-          <h2 id="add-project-modal-title">Add project</h2>
-          <p>Register an absolute path to a git repository root. Nothing is written outside that tree. Immediate subfolders of the server launch directory appear below for quick selection.</p>
+          <h2 id="add-project-modal-title">Add a folder</h2>
+          <p>Pick a folder inside the Loom launch directory below, or paste any absolute path. Nothing is written outside that tree.</p>
         </div>
         <button type="button" class="icon-btn" id="btn-add-project-close" aria-label="Close">×</button>
       </div>
@@ -400,6 +394,8 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260616-1"></script>
+  <script src="/static/vendor/xterm.js?v=5.5.0"></script>
+  <script src="/static/vendor/addon-fit.js?v=0.10.0"></script>
+  <script src="/static/app.js?v=20260618-24"></script>
 </body>
 </html>

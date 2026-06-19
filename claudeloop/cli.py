@@ -160,11 +160,6 @@ def web_cmd(
         "--openclaw-agent-id",
         help="Optional agentId for /hooks/agent payloads",
     ),
-    openclaw_deliver: bool = typer.Option(
-        False,
-        "--openclaw-deliver",
-        help="Set deliver=true for /hooks/agent payloads",
-    ),
     openclaw_channel: str | None = typer.Option(
         None,
         "--openclaw-channel",
@@ -206,7 +201,6 @@ def web_cmd(
         wake_mode=openclaw_wake_mode,
         agent_name=openclaw_agent_name,
         agent_id=openclaw_agent_id,
-        deliver=openclaw_deliver,
         channel=openclaw_channel,
         to=openclaw_to,
         debug=openclaw_debug,
@@ -249,8 +243,6 @@ def web_cmd(
             cmd.extend(["--openclaw-agent-name", openclaw_agent_name])
         if openclaw_agent_id:
             cmd.extend(["--openclaw-agent-id", openclaw_agent_id])
-        if openclaw_deliver:
-            cmd.append("--openclaw-deliver")
         if openclaw_channel:
             cmd.extend(["--openclaw-channel", openclaw_channel])
         if openclaw_to:

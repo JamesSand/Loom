@@ -176,10 +176,10 @@ function showPanel(id) {
     // The Claude tab embeds a read-only viewer for any scanned *.md
     // file in the task root - defaults to PLAN.md.
     updateMarkdownPreview('interview');
-    // Show the most-recent tmux output (terminal-style) the moment the
-    // user lands on this tab. The element was previously hidden so its
-    // scrollTop is stale (0 = top of buffer) - we want the bottom.
-    scrollTmuxOutputToBottom();
+    // The terminal may have fit to a default width while this tab was hidden;
+    // now that it's visible, refit so Claude fills the full screen width (and
+    // the tmux pane resizes to match).
+    termHandleResize();
     deferIdle(refreshInterviewPreview);
     deferIdle(refreshTaskTemplates);
     deferIdle(refreshClaudeSessions);
@@ -223,6 +223,8 @@ async function loadProjectsList() {
   STATE.projects = d.projects || [];
   STATE.launchRoot = String(d.launchRoot || '').trim();
   STATE.launchRootChildren = Array.isArray(d.launchRootChildren) ? d.launchRootChildren : [];
+  const addBtn = document.getElementById('btn-add-project');
+  if (addBtn) addBtn.title = STATE.launchRoot ? `Add a folder inside ${STATE.launchRoot}` : 'Add a folder';
   const cur = String(d.currentProjectId || d.defaultProjectId || '').trim();
   if (cur && STATE.projects.some((p) => p.id === cur)) {
     STATE.projectId = cur;
@@ -388,6 +390,8 @@ async function openAddProjectModal() {
   } catch (e) {
     $('#add-project-status').textContent = e.message;
   }
+  const titleEl = $('#add-project-modal-title');
+  if (titleEl) titleEl.textContent = STATE.launchRoot ? `Add a folder in ${STATE.launchRoot}` : 'Add a folder';
   renderAddProjectChips();
   requestAnimationFrame(() => $('#new-project-path').focus());
 }
@@ -505,6 +509,7 @@ function renderSkillsPicker() {
 
 async function loadTmuxSessions() {
   const ul = $('#tmux-sessions');
+  if (!ul) return;
   ul.innerHTML = '';
   try {
     if (!STATE.projectId) {
@@ -1100,6 +1105,7 @@ async function selectTask(slug) {
   updateActiveMarkdownPreview();
   $('#inp-interview-target').value = d.meta.tmux_interview_target || '';
   if (!d.meta.tmux_interview_target) {
+    disconnectTerminal();
     setTmuxOutputText('Click Start Claude to launch a tmux pane in the worktree.');
   }
   restorePaneDraftForTask(slug);
@@ -1129,8 +1135,7 @@ function applyAgentLabels(meta) {
   if (stopBtn) stopBtn.textContent = `Stop ${label}`;
   const heading = document.querySelector('.tab-panel[data-panel="claude"] .terminal-card__bar h4');
   if (heading) heading.textContent = `${label} Terminal`;
-  const out = document.getElementById('interview-out');
-  if (out && /^Click Start (Claude|Codex)/.test(out.textContent || '')) {
+  if (!TERM.connected && !termTarget()) {
     setTmuxOutputText(`Click Start ${label} to launch a tmux pane in the worktree.`);
   }
   // Show agent in info card + bind change.
@@ -1322,34 +1327,18 @@ async function saveTemplate(name, textareaId, statusId) {
 // bottom (most-recent output, the way a real terminal feels). If the
 // user has scrolled up to read earlier output, we leave their position
 // alone so polling doesn't yank them away.
-function setTmuxOutputText(text, scrollMode = 'auto') {
-  const out = document.getElementById('interview-out');
-  if (!out) return;
-  // When the element isn't laid out yet (e.g. tab hidden, clientHeight=0)
-  // treat that as "near bottom" so the next time the user actually sees
-  // the pane it lands at the latest output.
-  const nearBottom =
-    out.clientHeight === 0
-    || (out.scrollHeight - out.clientHeight - out.scrollTop) < 80;
-  out.textContent = text;
-  if (scrollMode === 'top') {
-    requestAnimationFrame(() => {
-      out.scrollTop = 0;
-    });
-  } else if (nearBottom) {
-    scrollTmuxOutputToBottom();
-  }
+function setTmuxOutputText(text) {
+  // Status messages only show when no live PTY stream is attached; once the
+  // terminal is streaming, the real output owns the screen.
+  const term = ensureTerminal();
+  if (!term || TERM.connected) return;
+  try {
+    term.reset();
+    term.write(String(text == null ? '' : text).replace(/\r?\n/g, '\r\n'));
+  } catch (e) {}
 }
 
-function scrollTmuxOutputToBottom() {
-  const out = document.getElementById('interview-out');
-  if (!out) return;
-  // Defer to next frame so scrollHeight reflects the freshly-set text
-  // (and so any "display: block" tab activation has actually laid out).
-  requestAnimationFrame(() => {
-    out.scrollTop = out.scrollHeight;
-  });
-}
+function scrollTmuxOutputToBottom() { /* xterm.js auto-scrolls on write */ }
 
 function revealInterviewTerminal(block = 'center') {
   const card = document.querySelector('.terminal-card--interview') || document.getElementById('interview-out');
@@ -1357,26 +1346,17 @@ function revealInterviewTerminal(block = 'center') {
   requestAnimationFrame(() => {
     card.scrollIntoView({ block, inline: 'nearest', behavior: 'smooth' });
   });
+  // Showing the terminal can change its available width (tab becomes visible,
+  // sidebar drawer closes); refit so it matches the now-visible size.
+  setTimeout(() => termHandleResize(), 80);
 }
 
-async function refreshInterviewPreview(force = false, scrollMode = 'auto') {
-  const target = $('#inp-interview-target').value.trim();
-  if (!target) return;
-  if (!force && STATE.pollInFlight.capture) return;
-  STATE.pollInFlight.capture = true;
-  try {
-    const d = await api('/api/tmux/capture?target=' + encodeURIComponent(target) + '&lines=200');
-    if ($('#inp-interview-target').value.trim() !== target) return;
-    setTmuxOutputText(d.ok ? d.text : (d.error || '(error)'), scrollMode);
-  } catch (err) {
-    if (isTransientApiError(err)) {
-      console.debug('tmux capture transient failure', err);
-    } else {
-      setTmuxOutputText(err.message);
-    }
-  } finally {
-    STATE.pollInFlight.capture = false;
-  }
+async function refreshInterviewPreview() {
+  // With xterm + a live PTY stream there's nothing to poll: just ensure the
+  // terminal is attached to the current pane (idempotent; reconnects if dropped).
+  const target = termTarget();
+  if (!target) { disconnectTerminal(); return; }
+  connectTerminal(target, false);
 }
 
 // ===== Changes (read-only git diff) tab =====
@@ -1472,7 +1452,17 @@ function renderChanges(d) {
     const branch = wt.branch || '(detached)';
     const base = wt.base ? (' · base ' + escapeHtml(wt.base)) : '';
     listParts.push('<div class="changes-wt">');
-    listParts.push('<div class="changes-wt__head" title="' + escapeHtml(wt.path) + '"><span class="changes-wt__name">' + escapeHtml(wtName) + '</span><span class="changes-wt__branch">' + escapeHtml(branch) + base + '</span></div>');
+    listParts.push(
+      '<div class="changes-wt__head" title="' + escapeHtml(wt.path) + '">' +
+        '<span class="changes-wt__name">' + escapeHtml(wtName) + '</span>' +
+        '<span class="changes-wt__branch">' + escapeHtml(branch) + base + '</span>' +
+        (wt.base
+          ? '<button type="button" class="changes-wt__merge" data-path="' + escapeHtml(wt.path) +
+            '" title="Merge this branch into the source repo base branch (no push)">Merge ↩</button>'
+          : '') +
+        '<button type="button" class="changes-wt__review" data-path="' + escapeHtml(wt.path) +
+          '" title="AI review (Bugbot-style) of this worktree diff vs your rules / the task skills">Review ⚖</button>' +
+      '</div>');
     if (!files.length) {
       listParts.push('<div class="changes-wt__empty">clean</div>');
     } else {
@@ -1500,7 +1490,79 @@ function renderChanges(d) {
       renderChangesDiffPanel();
     });
   });
+  body.querySelectorAll('.changes-wt__merge').forEach((btn) => {
+    btn.addEventListener('click', () => mergeWorktree(btn.dataset.path, btn));
+  });
+  body.querySelectorAll('.changes-wt__review').forEach((btn) => {
+    btn.addEventListener('click', () => reviewWorktree(btn.dataset.path, btn));
+  });
   renderChangesDiffPanel();
+}
+
+async function reviewWorktree(path, btn) {
+  if (!STATE.slug || !path) return;
+  const rulesEl = document.getElementById('changes-rules');
+  const rules = rulesEl ? rulesEl.value : '';
+  const host = document.getElementById('changes-diff');
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Reviewing…';
+  if (host) host.innerHTML = '<div class="changes-empty">Running review… (calls claude -p; ~10–60s)</div>';
+  try {
+    const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/review', {
+      method: 'POST',
+      body: JSON.stringify({ path, rules }),
+    });
+    if (!r.ok) throw new Error(r.error || 'review failed');
+    if (host) {
+      host.innerHTML =
+        '<div class="changes-diff__head">' +
+          '<span class="changes-diff__path">Review — ' + escapeHtml(changesBaseName(path)) + '</span>' +
+          '<span class="changes-diff__scope">claude</span>' +
+        '</div>' +
+        '<div class="markdown-preview changes-review">' + renderMarkdown(r.review || '') + '</div>';
+    }
+  } catch (err) {
+    if (host) host.innerHTML = '<div class="changes-empty">Review failed: ' + escapeHtml(err.message) + '</div>';
+  } finally {
+    btn.textContent = original;
+    btn.disabled = false;
+  }
+}
+
+async function mergeWorktree(path, btn) {
+  if (!STATE.slug || !path) return;
+  if (!confirm(
+    "Merge this worktree's branch into the source repo's base branch?\n\n" +
+    'Runs "git merge --no-ff" in the source repo: it refuses if that repo has ' +
+    'uncommitted changes, aborts on conflicts, and does NOT push. Only commits ' +
+    'already on the branch are merged.'
+  )) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Merging…';
+  try {
+    const r = await api('/api/tasks/' + encodeURIComponent(STATE.slug) + '/worktree/merge', {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    });
+    if (!r.ok) {
+      const conflicts = (r.conflicts && r.conflicts.length)
+        ? '\n\nConflicts:\n- ' + r.conflicts.join('\n- ')
+        : '';
+      alert((r.error || 'merge failed') + conflicts);
+      btn.textContent = original;
+      btn.disabled = false;
+      return;
+    }
+    btn.textContent = 'Merged \u2713';
+    refreshChangesView(true);
+    setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 1500);
+  } catch (err) {
+    alert(err.message || 'merge failed');
+    btn.textContent = original;
+    btn.disabled = false;
+  }
 }
 
 function renderDiffBody(f) {
@@ -1603,35 +1665,325 @@ async function setMonitor(enabled) {
   }
 }
 
-async function sendPaneText(submit = false) {
-  const target = $('#inp-interview-target').value.trim();
-  if (!target) {
-    alert('Start the interview pane first.');
-    return;
-  }
-  const input = $('#interview-in');
-  const text = input.value;
-  if (!text && !submit) return;
-  await api('/api/tmux/send-text', {
-    method: 'POST',
-    body: JSON.stringify({ target, text, submit }),
-  });
-  input.value = '';
-  clearPaneDraftForTask();
-  await refreshInterviewPreview(true);
+// ===== Real terminal (xterm.js) bound to the tmux pane via a live PTY stream.
+// Output: GET /api/tmux/stream chunks the actual terminal bytes (a `tmux attach`
+// PTY), rendered by xterm with true colors/cursor/TUI. Input: xterm.onData ->
+// /api/tmux/send-literal sends the raw byte sequences, so typing, arrows, Enter,
+// Esc, Ctrl-C, paste and IME all reach Claude exactly like a real terminal. =====
+const TERM = {
+  term: null,
+  fit: null,
+  target: '',
+  abort: null,
+  connected: false,
+  inputQueue: '',
+  inputSending: false,
+  resizeTimer: null,
+  lastSelection: '',
+};
+
+function termTarget() {
+  const el = document.getElementById('inp-interview-target');
+  return el ? el.value.trim() : '';
 }
 
-async function sendPaneKey(key) {
-  const target = $('#inp-interview-target').value.trim();
-  if (!target) {
-    alert('Start the interview pane first.');
+// --- clipboard (works over plain http:// where navigator.clipboard is blocked) -
+function termClipboardWrite(text) {
+  if (!text) return;
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text)
+      .then(() => termFlashCopied())
+      .catch(() => { if (termExecCopy(text)) termFlashCopied(); });
+  } else {
+    if (termExecCopy(text)) termFlashCopied();
+  }
+}
+
+function termExecCopy(text) {
+  let ok = false;
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    // Must be IN the viewport (not off-screen) or execCommand('copy') is a
+    // silent no-op in several browsers. Keep it invisible but on-screen.
+    ta.style.cssText =
+      'position:fixed;left:0;top:0;width:2em;height:2em;padding:0;border:0;' +
+      'margin:0;opacity:0;background:transparent;z-index:-1;';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { ta.setSelectionRange(0, text.length); } catch (e) {}
+    ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+  } catch (e) { console.debug('copy failed', e); ok = false; }
+  if (TERM.term) { try { TERM.term.focus(); } catch (e) {} }
+  return ok;
+}
+
+function termCopySelection() {
+  if (!TERM.term) return;
+  // The live stream can clear xterm's selection on redraw, so fall back to the
+  // last non-empty selection we saw.
+  const sel = TERM.term.getSelection() || TERM.lastSelection || '';
+  if (sel) termClipboardWrite(sel);
+}
+
+// Terminal-style copy/paste shortcuts. Returns false to stop xterm from also
+// sending the key to the pane.
+function termKeyEvent(e, term) {
+  if (e.type !== 'keydown') return true;
+  const k = (e.key || '').toLowerCase();
+  // Copy: Cmd+C (mac), Ctrl+Shift+C, or Ctrl+C while text is selected.
+  if ((e.metaKey && k === 'c')
+      || (e.ctrlKey && e.shiftKey && k === 'c')
+      || (e.ctrlKey && !e.shiftKey && k === 'c' && term.hasSelection())) {
+    termCopySelection();
+    return false;
+  }
+  // Paste: only suppress xterm's ^V on Ctrl+V (Linux/Win). Cmd+V (mac) makes
+  // xterm send nothing, and intercepting it here swallows the browser's native
+  // 'paste' event - so let Cmd+V through; the 'paste' listener does the paste.
+  if (e.ctrlKey && !e.metaKey && k === 'v') {
+    return false;
+  }
+  return true;
+}
+
+function ensureTerminal() {
+  if (TERM.term) return TERM.term;
+  const host = document.getElementById('interview-term');
+  if (!host || typeof Terminal === 'undefined') return null;
+  const term = new Terminal({
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace',
+    fontSize: 13,
+    lineHeight: 1.15,
+    cursorBlink: true,
+    cursorInactiveStyle: 'outline',
+    macOptionIsMeta: true,
+    scrollback: 8000,
+    theme: {
+      // Warm-dark: Claude's TUI assumes a dark terminal, so white/bright text
+      // needs a dark background to stay readable.
+      background: '#211d1a', foreground: '#e7ddcf',
+      cursor: '#f59e0b', cursorAccent: '#211d1a',
+      selectionBackground: 'rgba(245,158,11,0.30)',
+      black: '#2b2620', red: '#e06c5a', green: '#9ec46a', yellow: '#e0af68',
+      blue: '#7aa2f7', magenta: '#c79bf0', cyan: '#79c7c7', white: '#d8cfc2',
+      brightBlack: '#7a6f60', brightRed: '#f08a7a', brightGreen: '#b6d98a', brightYellow: '#f0c987',
+      brightBlue: '#9bb8fa', brightMagenta: '#d4b3f5', brightCyan: '#9bd9d9', brightWhite: '#fdf6ea',
+    },
+  });
+  let fit = null;
+  try { fit = new FitAddon.FitAddon(); term.loadAddon(fit); } catch (err) { console.debug('fit addon missing', err); }
+  term.open(host);
+  try { if (fit) fit.fit(); } catch (e) {}
+  term.onData((data) => termQueueInput(data));
+  term.attachCustomKeyEventHandler((e) => termKeyEvent(e, term));
+  term.onSelectionChange(() => {
+    const s = term.getSelection();
+    if (s) TERM.lastSelection = s;
+  });
+  // Copy-on-select (tmux / iTerm style): copy the moment a selection finishes.
+  // This is the only reliable copy path here — the live PTY stream redraws and
+  // clears xterm's selection before a later Cmd/Ctrl+C keydown can read it, so
+  // copying at mouseup time is what actually works. Shortcuts below stay as a
+  // fallback for keyboard-only selection.
+  host.addEventListener('mouseup', () => {
+    const s = term.getSelection();
+    if (s && s.trim()) { TERM.lastSelection = s; termClipboardWrite(s); }
+  });
+  // Native paste: clipboardData works even over plain http:// where the async
+  // navigator.clipboard API is blocked. Capture phase so we beat xterm's own
+  // paste handler and avoid a double paste.
+  if (term.textarea) {
+    term.textarea.addEventListener('paste', (e) => {
+      const cd = e.clipboardData || window.clipboardData;
+      if (!cd) return;
+      const t = cd.getData('text');
+      if (t) { e.preventDefault(); e.stopImmediatePropagation(); termPaste(t); }
+    }, true);
+  }
+  // Mouse/touchpad wheel -> scroll tmux's own scrollback (copy-mode), instead of
+  // letting xterm convert the wheel into arrow keys for the full-screen app.
+  // Scrolling back down to the bottom auto-exits copy-mode (live output resumes).
+  let wheelAccum = 0;
+  let wheelTimer = null;
+  host.addEventListener('wheel', (e) => {
+    if (!TERM.connected || !termTarget()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    wheelAccum += (e.deltaMode === 1 ? e.deltaY * 18 : e.deltaY);
+    if (wheelTimer) return;
+    wheelTimer = setTimeout(() => {
+      const dy = wheelAccum; wheelAccum = 0; wheelTimer = null;
+      if (!dy) return;
+      const lines = Math.max(1, Math.min(80, Math.round(Math.abs(dy) / 24)));
+      api('/api/tmux/scroll', {
+        method: 'POST',
+        body: JSON.stringify({ target: termTarget(), dir: dy < 0 ? 'up' : 'down', lines }),
+      }).catch(() => {});
+    }, 40);
+  }, { passive: false, capture: true });
+  TERM.term = term;
+  TERM.fit = fit;
+  const live = document.getElementById('interview-live');
+  host.addEventListener('focusin', () => { if (live) live.hidden = false; });
+  host.addEventListener('focusout', () => { if (live) live.hidden = true; });
+  // Clicking the host padding (outside the xterm screen) should still focus the
+  // terminal so keys go to Claude. Guarded to the host itself so click-drag text
+  // selection on the screen is left to xterm.
+  host.addEventListener('pointerdown', (e) => {
+    if (e.target === host) { try { term.focus(); } catch (_) {} }
+  });
+  try {
+    const ro = new ResizeObserver(() => termHandleResize());
+    ro.observe(host);
+  } catch (e) {}
+  window.addEventListener('resize', termHandleResize);
+  // Monospace metrics finalize after the web font loads; refit so column count
+  // (and the tmux pane width) matches the real glyph width.
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => termHandleResize()).catch(() => {});
+  }
+  return term;
+}
+
+function termHandleResize() {
+  if (!TERM.fit || !TERM.term) return;
+  if (TERM.resizeTimer) clearTimeout(TERM.resizeTimer);
+  TERM.resizeTimer = setTimeout(() => {
+    TERM.resizeTimer = null;
+    const prevCols = TERM.term.cols;
+    const prevRows = TERM.term.rows;
+    try { TERM.fit.fit(); } catch (e) {}
+    // Only reconnect when the fitted size actually changed, so tmux resizes the
+    // pane to match xterm (Claude re-renders to fill the width) without flashing.
+    if (TERM.connected && TERM.target
+        && (TERM.term.cols !== prevCols || TERM.term.rows !== prevRows)) {
+      connectTerminal(TERM.target, true);
+    }
+  }, 300);
+}
+
+async function termQueueInput(data) {
+  TERM.inputQueue += data;
+  if (TERM.inputSending) return;
+  TERM.inputSending = true;
+  try {
+    while (TERM.inputQueue) {
+      const chunk = TERM.inputQueue;
+      TERM.inputQueue = '';
+      const target = termTarget();
+      if (!target) break;
+      try {
+        await api('/api/tmux/send-literal', { method: 'POST', body: JSON.stringify({ target, text: chunk }) });
+      } catch (err) { console.debug('input send failed', err); }
+    }
+  } finally {
+    TERM.inputSending = false;
+  }
+}
+
+// Send raw bytes to the pane (used by paste + the mobile key bar). Reuses the
+// same batched queue as keystrokes so ordering with live typing is preserved.
+function termSendLiteral(text) {
+  if (text == null || text === '') return;
+  termQueueInput(String(text));
+}
+
+// Paste into the pane. A short single line goes through the fast literal path
+// (keeps ordering with live typing); anything multi-line or large goes through
+// tmux bracketed paste so the TUI (Claude) treats it as ONE paste and doesn't
+// submit on every embedded newline (and we avoid the send-literal size cap).
+function termPaste(text) {
+  if (!text) return;
+  const target = termTarget();
+  if (!target) return;
+  if (!/[\r\n]/.test(text) && text.length <= 2000) {
+    termSendLiteral(text);
     return;
   }
-  await api('/api/tmux/send-key', {
+  api('/api/tmux/send-text', {
     method: 'POST',
-    body: JSON.stringify({ target, key }),
-  });
-  await refreshInterviewPreview(true);
+    body: JSON.stringify({ target, text, submit: false }),
+  }).catch((err) => console.debug('paste failed', err));
+}
+
+// The live PTY stream repaints on its own, so there's nothing to poll here; this
+// just nudges the read-only markdown preview after a compose-box message in case
+// it changed PLAN.md (or another scanned file).
+function termScheduleRefresh() {
+  if (termScheduleRefresh._t) clearTimeout(termScheduleRefresh._t);
+  termScheduleRefresh._t = setTimeout(() => {
+    termScheduleRefresh._t = null;
+    try { refreshInterviewPreview(true); } catch (e) {}
+  }, 800);
+}
+
+// Small transient "已复制" toast shown after a successful clipboard copy.
+function termFlashCopied() {
+  const card = document.querySelector('.terminal-card--interview');
+  if (!card) return;
+  let el = card.querySelector('.term-copied-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'term-copied-toast';
+    el.textContent = '已复制';
+    card.appendChild(el);
+  }
+  el.classList.add('is-show');
+  if (termFlashCopied._t) clearTimeout(termFlashCopied._t);
+  termFlashCopied._t = setTimeout(() => el.classList.remove('is-show'), 900);
+}
+
+function disconnectTerminal() {
+  if (TERM.abort) { try { TERM.abort.abort(); } catch (e) {} TERM.abort = null; }
+  TERM.connected = false;
+  TERM.target = '';
+}
+
+async function connectTerminal(target, force = false) {
+  const term = ensureTerminal();
+  if (!term || !target) return;
+  if (!force && TERM.connected && TERM.target === target) return;
+  disconnectTerminal();
+  TERM.target = target;
+  TERM.connected = true;
+  const ctrl = new AbortController();
+  TERM.abort = ctrl;
+  try { if (TERM.fit) TERM.fit.fit(); } catch (e) {}
+  // Layout + web-font metrics often settle a beat after the panel/stream opens;
+  // nudge a refit so cols match the visible width (and the tmux pane is resized
+  // to match), so the terminal auto-fits instead of needing a sideways scroll.
+  // termHandleResize only reconnects when the size actually changed.
+  if (!force) {
+    setTimeout(() => termHandleResize(), 350);
+    setTimeout(() => termHandleResize(), 1200);
+  }
+  const cols = term.cols || 80;
+  const rows = term.rows || 24;
+  try { term.reset(); } catch (e) {}
+  try {
+    const resp = await fetch(
+      '/api/tmux/stream?target=' + encodeURIComponent(target) + '&cols=' + cols + '&rows=' + rows,
+      { signal: ctrl.signal, cache: 'no-store' },
+    );
+    if (!resp.ok || !resp.body) {
+      if (TERM.abort === ctrl) { TERM.connected = false; TERM.abort = null; }
+      return;
+    }
+    const reader = resp.body.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value && TERM.term && TERM.target === target) TERM.term.write(value);
+    }
+  } catch (err) {
+    if (err && err.name !== 'AbortError') console.debug('terminal stream error', err);
+  } finally {
+    if (TERM.abort === ctrl) { TERM.connected = false; TERM.abort = null; }
+  }
 }
 
 function startPanePolling() {
@@ -1844,7 +2196,6 @@ $('#add-project-modal').addEventListener('click', (event) => {
   if (event.target.id === 'add-project-modal') closeAddProjectModal();
 });
 
-document.getElementById('btn-tmux-refresh').addEventListener('click', loadTmuxSessions);
 document.getElementById('btn-tasks-refresh').addEventListener('click', loadTasks);
 
 (function initTaskFilter() {
@@ -2068,9 +2419,12 @@ async function refreshKernelService() {
 }
 
 function applyKernelShapeTemplate() {
+  // Shape is agent-decided now, so don't fill the field. Surface the plugin's
+  // template (when known) as a placeholder hint for the optional override.
   const plugin = $('#kernel-plugin').value;
   const tpl = (STATE.kernelShapeTemplates || {})[plugin];
-  if (tpl) $('#kernel-shape').value = JSON.stringify(tpl, null, 2);
+  const el = $('#kernel-shape');
+  if (el) el.placeholder = tpl ? JSON.stringify(tpl, null, 2) : '(agent decides — optional override)';
 }
 
 async function loadKernelPlugins() {
@@ -2186,7 +2540,10 @@ function renderKernelRunDetail(r) {
   const st = r.status || {};
   const best = st.best || null;
   const bests = (st.agent_bests || []).slice().sort((a, b) => (b.speedup || 0) - (a.speedup || 0));
-  const shape = typeof cfg.shape === 'string' ? cfg.shape : JSON.stringify(cfg.shape);
+  const shapeText = cfg.shape == null
+    ? (cfg.shape_source === 'template' ? 'plugin default' : 'agent-deciding…')
+    : (typeof cfg.shape === 'string' ? cfg.shape : JSON.stringify(cfg.shape));
+  const shapeSrc = cfg.shape_source ? ` <span class="kernel-shape-src">(${escapeHtml(cfg.shape_source)})</span>` : '';
   const plugin = r.plugin || cfg.plugin || '';
   const unverified = !!plugin && ((STATE.kernelUnverified || []).includes(plugin) || r.verified === false);
   const vbadge = plugin ? (unverified ? ' <span class="kernel-unverified">⚠ unverified reference</span>' : ' <span class="kernel-verified">✓ verified</span>') : '';
@@ -2198,7 +2555,7 @@ function renderKernelRunDetail(r) {
   html += '<div class="kernel-detail__grid">';
   html += `<span>State</span><span class="kernel-run__state" data-state="${escapeHtml(r.state || '')}">${escapeHtml(r.state || '')}</span>`;
   html += `<span>Run ID</span><code>${escapeHtml(r.run_id || '—')}</code>`;
-  html += `<span>Shape</span><code>${escapeHtml(shape)}</code>`;
+  html += `<span>Shape</span><span><code>${escapeHtml(shapeText)}</code>${shapeSrc}</span>`;
   html += `<span>Model</span><span>${escapeHtml(cfg.model || '')}</span>`;
   html += `<span>Best speedup</span><span class="kernel-speedup">${kernelSpeedupText(best)}</span>`;
   if (st.target_speedup) html += `<span>Target</span><span>${Number(st.target_speedup).toFixed(2)}×</span>`;
@@ -2316,16 +2673,20 @@ async function refreshSelectedKernelDetail() {
 
 async function launchKernelRun() {
   const status = $('#kernel-launch-status');
-  let shape;
-  try { shape = JSON.parse($('#kernel-shape').value); }
-  catch { status.textContent = 'Shape must be valid JSON'; return; }
+  // Shape is optional: blank => the agent proposes one at launch. Only parse and
+  // validate when the user typed an explicit override.
+  const rawShape = ($('#kernel-shape').value || '').trim();
+  let shape = null;
+  if (rawShape) {
+    try { shape = JSON.parse(rawShape); }
+    catch { status.textContent = 'Override shape must be valid JSON (or leave it blank)'; return; }
+  }
   const model = $('#kernel-model').value.trim();
   if (!model) { status.textContent = 'Model is required'; return; }
   const buildMode = $('#kernel-build-mode') ? $('#kernel-build-mode').checked : false;
   const body = {
     plugin: $('#kernel-plugin').value,
     target: $('#kernel-target').value,
-    shape,
     model,
     n_agents: Number($('#kernel-nagents').value) || 1,
     starter_mode: $('#kernel-starter').value,
@@ -2333,10 +2694,13 @@ async function launchKernelRun() {
     build: $('#kernel-build').checked,
     build_mode: buildMode,
   };
+  if (shape) body.shape = shape;
   const ts = $('#kernel-target-speedup').value;
   if (ts) body.target_speedup = Number(ts);
   if (buildMode && body.target_speedup === undefined) body.target_speedup = 0;
-  status.textContent = 'Launching… (first run builds the image — this can take a few minutes)';
+  status.textContent = shape
+    ? 'Launching… (first run builds the image — this can take a few minutes)'
+    : 'Launching… the agent is choosing a shape, then building (first run can take a few minutes)';
   try {
     const r = await api('/api/kernel/runs', { method: 'POST', body: JSON.stringify(body) });
     status.textContent = 'Launched ' + r.id + ' — starting agents…';
@@ -2460,7 +2824,13 @@ function renderKernelChat() {
 function fillFormFromSpec(spec) {
   if (!spec) return;
   if (spec.target && $('#kernel-target')) $('#kernel-target').value = spec.target;
-  if (spec.shape && $('#kernel-shape')) $('#kernel-shape').value = JSON.stringify(spec.shape, null, 2);
+  if (spec.shape && $('#kernel-shape')) {
+    // The interview agent inferred a shape — show it in the (optional) override
+    // so the user can review or tweak it before launching.
+    $('#kernel-shape').value = JSON.stringify(spec.shape, null, 2);
+    const adv = document.getElementById('kernel-advanced-shape');
+    if (adv) adv.open = true;
+  }
   if (spec.model && $('#kernel-model')) $('#kernel-model').value = spec.model;
   if (spec.n_agents && $('#kernel-nagents')) $('#kernel-nagents').value = spec.n_agents;
   if (spec.starter_mode && $('#kernel-starter')) $('#kernel-starter').value = spec.starter_mode;
@@ -2483,8 +2853,9 @@ async function prepareKernel(spec) {
         fillFormFromSpec(spec);
         if (rec.plugin && $('#kernel-plugin')) {
           $('#kernel-plugin').value = rec.plugin;
-          // If the interview spec didn't carry a usable shape, fall back to
-          // the resolved plugin's shape template so the form isn't blank.
+          // Refresh the override placeholder for the resolved plugin. The field
+          // stays blank on purpose — the agent picks the shape at launch unless
+          // the user types an override.
           if (!($('#kernel-shape').value || '').trim()) applyKernelShapeTemplate();
         }
         const v = rec.verified ? '' : ' ⚠ unverified reference — review before trusting results.';
@@ -2614,7 +2985,7 @@ function renderWorktreeListInto(wtHost, pushAllBtn, meta, statuses, primaryLabel
   for (const s of (Array.isArray(statuses) ? statuses : [])) {
     if (s && s.path) statusByPath[s.path] = s;
   }
-  if (pushAllBtn) pushAllBtn.hidden = worktrees.length === 0;
+  if (pushAllBtn) pushAllBtn.hidden = worktrees.length <= 1;
   if (!wtHost) return;
   wtHost.innerHTML = '';
   if (!worktrees.length) {
@@ -2624,46 +2995,52 @@ function renderWorktreeListInto(wtHost, pushAllBtn, meta, statuses, primaryLabel
     wtHost.appendChild(hint);
     return;
   }
+  // Compact picker: a dropdown to choose a worktree, its live status, and the
+  // Push / remove buttons on the right acting on the *selected* worktree.
+  const row = document.createElement('div');
+  row.className = 'wt-picker';
+
+  const sel = document.createElement('select');
+  sel.className = 'wt-select';
   worktrees.forEach((path, i) => {
-    const row = document.createElement('div');
-    row.className = 'wt-list-row' + (i === 0 ? ' wt-list-row--primary' : '');
-    const main = document.createElement('div');
-    main.className = 'wt-list-row__main';
-    const pathEl = document.createElement('code');
-    pathEl.className = 'wt-list-row__path';
-    pathEl.textContent = path;
-    if (i === 0) pathEl.title = primaryLabel || 'Primary worktree';
-    main.appendChild(pathEl);
-    const br = document.createElement('span');
-    br.className = 'wt-list-row__branch';
-    br.textContent = (branches[i] || '').trim() || '—';
-    main.appendChild(br);
-    const st = statusByPath[path];
-    if (st) main.appendChild(renderWorktreeStatusBadge(st));
-    row.appendChild(main);
-    if (i === 0) {
-      const pill = document.createElement('span');
-      pill.className = 'wt-list-row__pill';
-      pill.textContent = 'primary';
-      row.appendChild(pill);
-    }
-    const push = document.createElement('button');
-    push.type = 'button';
-    push.className = 'wt-list-row__push';
-    push.title = `git push -u origin ${(branches[i] || '').trim() || 'branch'}`;
-    push.textContent = 'Push';
-    push.addEventListener('click', () => pushWorktree(path, push));
-    row.appendChild(push);
-    const rm = document.createElement('button');
-    rm.type = 'button';
-    rm.className = 'wt-list-row__remove';
-    rm.title = 'Remove this worktree (git worktree remove + delete dir)';
-    rm.setAttribute('aria-label', 'Remove worktree');
-    rm.textContent = '×';
-    rm.addEventListener('click', () => removeWorktree(path));
-    row.appendChild(rm);
-    wtHost.appendChild(row);
+    const opt = document.createElement('option');
+    opt.value = path;
+    const br = (branches[i] || '').trim() || '—';
+    opt.textContent = `${changesBaseName(path)} · ${br}${i === 0 ? ' · primary' : ''}`;
+    opt.title = path;
+    sel.appendChild(opt);
   });
+  row.appendChild(sel);
+
+  const badgeHost = document.createElement('span');
+  badgeHost.className = 'wt-picker__status';
+  const renderBadge = () => {
+    badgeHost.innerHTML = '';
+    const st = statusByPath[sel.value];
+    if (st) badgeHost.appendChild(renderWorktreeStatusBadge(st));
+  };
+  sel.addEventListener('change', renderBadge);
+  row.appendChild(badgeHost);
+
+  const push = document.createElement('button');
+  push.type = 'button';
+  push.className = 'btn btn--sm wt-picker__push';
+  push.textContent = 'Push';
+  push.title = 'git push -u origin <selected branch>';
+  push.addEventListener('click', () => pushWorktree(sel.value, push));
+  row.appendChild(push);
+
+  const rm = document.createElement('button');
+  rm.type = 'button';
+  rm.className = 'wt-list-row__remove';
+  rm.title = 'Remove the selected worktree (git worktree remove + delete dir)';
+  rm.setAttribute('aria-label', 'Remove selected worktree');
+  rm.textContent = '×';
+  rm.addEventListener('click', () => removeWorktree(sel.value));
+  row.appendChild(rm);
+
+  wtHost.appendChild(row);
+  renderBadge();
 }
 
 // Render the worktree card inside the Kernel Lab task view.
@@ -2706,35 +3083,41 @@ function renderClaudeInfo(meta, claude, statuses) {
     sessHost.appendChild(span);
     return;
   }
-  for (const s of sessions) {
-    const row = document.createElement('div');
-    row.className = 'claude-session';
-    row.dataset.sessionId = s.id || '';
-    const idEl = document.createElement('code');
-    idEl.className = 'claude-session__id';
-    idEl.title = s.id || '';
-    idEl.textContent = shortSessionId(s.id);
-    const meta_ = document.createElement('span');
-    meta_.className = 'claude-session__meta';
-    const parts = [];
-    if (s.mtime) parts.push(formatSessionMtime(s.mtime));
-    if (s.size) parts.push(`${Math.max(1, Math.round(s.size / 1024))} KB`);
-    if (!s.path) parts.push('on-disk file not found');
-    meta_.textContent = parts.join(' · ') || '(no on-disk transcript yet)';
-    const resume = document.createElement('button');
-    resume.type = 'button';
-    resume.className = 'btn btn--sm';
-    resume.textContent = 'Resume';
-    resume.disabled = !s.id || (claude.agent_running === true);
-    resume.title = claude.agent_running
-      ? `Stop the running pane command (${claude.pane_command || 'agent'}) before resuming.`
-      : 'Resume in a fresh or idle tmux pane.';
-    resume.addEventListener('click', () => resumeClaudeSession(s.id));
-    row.appendChild(idEl);
-    row.appendChild(meta_);
-    row.appendChild(resume);
-    sessHost.appendChild(row);
-  }
+  // Dropdown of sessions (newest first) + a single Resume button on the right,
+  // mirroring the worktree picker. Resuming acts on the selected session.
+  const running = claude.agent_running === true;
+  const row = document.createElement('div');
+  row.className = 'session-picker';
+
+  const sel = document.createElement('select');
+  sel.className = 'session-select';
+  sel.setAttribute('aria-label', 'Claude session to resume');
+  sessions.forEach((s) => {
+    const opt = document.createElement('option');
+    opt.value = s.id || '';
+    const bits = [shortSessionId(s.id)];
+    if (s.mtime) bits.push(formatSessionMtime(s.mtime));
+    if (s.size) bits.push(`${Math.max(1, Math.round(s.size / 1024))} KB`);
+    if (!s.path) bits.push('no transcript');
+    opt.textContent = bits.join(' · ');
+    opt.title = s.id || '';
+    if (!s.id) opt.disabled = true;
+    sel.appendChild(opt);
+  });
+  row.appendChild(sel);
+
+  const resume = document.createElement('button');
+  resume.type = 'button';
+  resume.className = 'btn btn--sm session-picker__resume';
+  resume.textContent = 'Resume';
+  resume.disabled = running;
+  resume.title = running
+    ? `Stop the running pane command (${claude.pane_command || 'agent'}) before resuming.`
+    : 'Resume the selected session in a fresh or idle tmux pane.';
+  resume.addEventListener('click', () => { if (sel.value) resumeClaudeSession(sel.value); });
+  row.appendChild(resume);
+
+  sessHost.appendChild(row);
 }
 
 // ===== Worktree picker modal =====
@@ -2977,6 +3360,75 @@ document.getElementById('btn-run-goal').addEventListener('click', runGoalFromPla
 document.getElementById('btn-write-result').addEventListener('click', writeResultToPlan);
 document.getElementById('btn-changes-refresh').addEventListener('click', () => refreshChangesView(true));
 
+// Mobile/touch terminal keys: phone keyboards have no Esc/Ctrl-C/arrows/Tab, so
+// this bar sends the raw byte sequences into the pane (send_pane_literal also
+// leaves copy-mode first, so it works even after scrolling).
+// Compose box: a normal input where the OS IME works reliably (xterm's built-in
+// CJK input is buggy - repeats/loses characters). Enter sends the line into the
+// pane and clears. English/keys can still be typed straight into the terminal.
+(function initTermCompose() {
+  const input = document.getElementById('term-compose-input');
+  const sendBtn = document.getElementById('term-compose-send');
+  const toggle = document.getElementById('term-compose-toggle');
+  const box = document.getElementById('term-compose');
+  if (!input) return;
+  const MAX_H = 168;
+  function autoGrow() {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, MAX_H) + 'px';
+  }
+  function setOpen(open) {
+    if (!box) return;
+    box.hidden = !open;
+    if (toggle) toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) { autoGrow(); input.focus(); }
+    else if (TERM.term) { try { TERM.term.focus(); } catch (e) {} }
+  }
+  async function submitCompose() {
+    const text = input.value;
+    const target = termTarget();
+    if (!text.trim() || !target) return;
+    input.value = '';
+    autoGrow();
+    try {
+      await api('/api/tmux/send-text', {
+        method: 'POST',
+        body: JSON.stringify({ target, text, submit: true }),
+      });
+    } catch (err) { console.debug('compose send failed', err); }
+    termScheduleRefresh();
+    input.focus();
+  }
+  input.addEventListener('input', autoGrow);
+  input.addEventListener('keydown', (e) => {
+    // Enter sends; Shift+Enter inserts a newline (default textarea behaviour);
+    // the Enter that commits an IME composition has isComposing=true and must
+    // be left alone so Chinese input still works.
+    if (e.key === 'Enter' && !e.isComposing && !e.shiftKey) {
+      e.preventDefault();
+      submitCompose();
+    }
+  });
+  if (sendBtn) sendBtn.addEventListener('click', submitCompose);
+  // Collapsed by default; the 中文 button reveals the reliable-IME compose box.
+  if (toggle) toggle.addEventListener('click', () => setOpen(box && box.hidden));
+})();
+
+(function initTermMobileKeys() {
+  const bar = document.getElementById('term-mobile-keys');
+  if (!bar) return;
+  const SEQ = {
+    esc: '\x1b', 'c-c': '\x03', tab: '\t', enter: '\r',
+    up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D',
+  };
+  bar.addEventListener('click', (e) => {
+    const btn = e.target.closest('.term-key');
+    if (!btn) return;
+    const seq = SEQ[btn.dataset.key];
+    if (seq != null) termSendLiteral(seq);
+  });
+})();
+
 (() => {
   const toggle = document.getElementById('monitor-toggle');
   if (toggle) toggle.addEventListener('change', () => setMonitor(toggle.checked));
@@ -2991,17 +3443,8 @@ document.getElementById('btn-interview-stop').addEventListener('click', async ()
   });
   $('#inp-interview-target').value = '';
   $('#interview-target-label').textContent = 'Not started';
+  disconnectTerminal();
   setTmuxOutputText(`Stopped ${r.tmux_session || ''}\n${r.tmux_message || ''}`);
-});
-
-document.getElementById('btn-interview-send').addEventListener('click', () => sendPaneText(true));
-
-document.getElementById('interview-in').addEventListener('input', () => {
-  savePaneDraftForTask();
-});
-
-document.querySelectorAll('.pane-actions [data-key]').forEach((btn) => {
-  btn.addEventListener('click', () => sendPaneKey(btn.dataset.key));
 });
 
 document.getElementById('btn-delete-task').addEventListener('click', deleteSelectedTask);

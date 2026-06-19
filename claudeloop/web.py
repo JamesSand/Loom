@@ -60,6 +60,7 @@ from claudeloop.rud_task import (
     list_task_worktrees,
     list_tasks,
     list_worktree_candidates,
+    merge_worktree_to_base,
     normalize_agent,
     prepare_task_worktree_from,
     push_worktree_branch,
@@ -77,6 +78,7 @@ from claudeloop.rud_task import (
     task_worktree_diffs,
     task_worktree_path,
     update_meta,
+    worktree_diff,
     worktree_status,
     write_kernel_interview,
     write_project_notes,
@@ -87,7 +89,10 @@ from claudeloop.tmux_util import (
     capture_pane,
     list_tmux_panes,
     list_tmux_sessions,
+    open_pane_attach,
+    scroll_pane,
     send_pane_key,
+    send_pane_literal,
     send_pane_text,
     tmux_available,
     tmux_subprocess_env,
@@ -517,17 +522,102 @@ def _run_kernel_launch_streaming(
     return bool(data.get("ok")), data
 
 
+def _kernel_propose_shape(root: Path, cfg: dict[str, Any]) -> Any:
+    """Have the host ``claude`` CLI choose a representative benchmark shape for
+    the kernel op, so the shape is agent-decided rather than a human input.
+
+    Returns the shape (a dict) or ``None`` on any failure, in which case the
+    caller omits ``--shape`` and the tkcc helper falls back to the plugin's
+    default template.
+    """
+    plugin = str(cfg.get("plugin", "")).strip()
+    target = str(cfg.get("target", "")).strip()
+    model = str(cfg.get("model", "")).strip()
+    if not plugin:
+        return None
+    # Show the agent the plugin's expected shape keys (if known) so it returns a
+    # shape the evaluator can actually use; a freshly-resolved plugin has none,
+    # and the agent infers the keys from the operation instead.
+    tpl = None
+    try:
+        ok, data = _run_kernel_helper(root, ["plugins"], timeout=30)
+        if ok:
+            tpl = (data.get("shape_templates") or {}).get(plugin)
+    except Exception:  # noqa: BLE001
+        tpl = None
+    if tpl is not None:
+        keys_hint = (
+            "The shape is a JSON object with EXACTLY these keys (example values "
+            "shown — keep the keys, pick realistic representative values for a "
+            f"meaningful benchmark):\n{json.dumps(tpl)}"
+        )
+    else:
+        keys_hint = (
+            "Infer the correct shape keys for this operation yourself (e.g. "
+            "batch, heads, seq_len, head_dim, m/n/k, page_size, dtype as "
+            "appropriate) and pick realistic, representative values for a "
+            "meaningful benchmark."
+        )
+    prompt = (
+        "You are choosing ONE representative benchmark shape for a GPU kernel "
+        f'optimization run. Operation/plugin: "{plugin}". Target backend: '
+        f'"{target or "unspecified"}".\n\n{keys_hint}\n\n'
+        "Reply with ONLY a single fenced ```json code block containing the shape "
+        "object, and no other prose."
+    )
+    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
+    # Only forward a Claude model; codex/gpt models aren't valid for `claude`.
+    if model.startswith("claude-"):
+        cmd += ["--model", model]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    text = (proc.stdout or "").strip()
+    if not text:
+        return None
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL) or re.search(
+        r"(\{.*\})", text, re.DOTALL
+    )
+    if not m:
+        return None
+    try:
+        shape = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    return shape if isinstance(shape, dict) and shape else None
+
+
 def _launch_kernel_run(root: Path, run_uid: str, cfg: dict[str, Any]) -> None:
     """Background worker: run the helper's launch and update the run record."""
+    # Shape is no longer a human input. Use an explicit override when supplied,
+    # otherwise let an agent propose a representative shape at launch. If that
+    # also fails, omit --shape so the tkcc helper falls back to the plugin's
+    # default template.
+    if cfg.get("shape"):
+        cfg["shape_source"] = "override"
+    else:
+        proposed = _kernel_propose_shape(root, cfg)
+        if proposed:
+            cfg["shape"] = proposed
+            cfg["shape_source"] = "agent"
+        else:
+            cfg["shape_source"] = "template"
+    # Persist the resolved shape early so the UI reflects the agent's choice
+    # while the (slow) build + launch runs.
+    early = _kernel_read_record(root, run_uid) or {"id": run_uid}
+    early["config"] = cfg
+    _kernel_write_record(root, early)
     args = [
         "launch",
         "--plugin", str(cfg["plugin"]),
         "--target", str(cfg["target"]),
-        "--shape", _shape_to_str(cfg["shape"]),
         "--model", str(cfg["model"]),
         "--n-agents", str(cfg.get("n_agents", 1)),
         "--starter-mode", str(cfg.get("starter_mode", "none")),
     ]
+    if cfg.get("shape"):
+        args += ["--shape", _shape_to_str(cfg["shape"])]
     if cfg.get("target_speedup") is not None:
         args += ["--target-speedup", str(cfg["target_speedup"])]
     if cfg.get("auto_terminate"):
@@ -538,6 +628,8 @@ def _launch_kernel_run(root: Path, run_uid: str, cfg: dict[str, Any]) -> None:
         args += ["--build-mode"]
     ok, data = _run_kernel_launch_streaming(root, run_uid, args, timeout=2400)
     rec = _kernel_read_record(root, run_uid) or {"id": run_uid}
+    # Persist the resolved shape + how it was chosen so the UI can show it.
+    rec["config"] = cfg
     if ok:
         rec.update({
             "state": "running",
@@ -641,7 +733,9 @@ def _prepare_kernel_run(root: Path, prep_uid: str, spec: dict[str, Any]) -> None
 
 _KERNEL_INTERVIEW_SYS = """You are running a short technical interview inside "Kernel Lab" to collect everything needed to (a) define a TKCC eval plugin for a GPU kernel and (b) launch an optimization run for it. Ask ONE focused question at a time and be concise. If the user gives a GitHub raw URL or a source link, use your tools to read it and INFER as much as possible (dims, dtype, operation) — only ask what you cannot infer.
 
-Collect: source (a GitHub raw URL, a kernel name, or a clear description of the operation); target hardware (SM100 -> cutedsl/fp8, or H100 -> cuda with bf16/fp8 — this affects whether benchmarking is possible here); operation shape/dims (operation-specific; for attention: heads, head_dim or latent+rope, page_size, KV length, query length Sq, batch, dtype); run params (target speedup [optional], number of agents, starter mode where "preset" means use the user's file as starting code).
+Collect: source (a GitHub raw URL, a kernel name, or a clear description of the operation); target hardware (SM100 -> cutedsl/fp8, or H100 -> cuda with bf16/fp8 — this affects whether benchmarking is possible here); run params (target speedup [optional], number of agents, starter mode where "preset" means use the user's file as starting code).
+
+Do NOT ask the user for the operation shape/dims. Infer a single representative shape yourself from the source/operation (operation-specific; for attention: heads, head_dim or latent+rope, page_size, KV length, query length Sq, batch, dtype) and include it in the spec — the evaluator benchmarks this shape and the user can override it later if needed.
 
 When AND ONLY WHEN you have everything, reply with ONLY a fenced ```json code block (no other prose), shaped like:
 {"done": true, "spec": {"source": "<url-or-name>", "target": "cutedsl", "shape": {"batch_size": 4, "num_heads": 128}, "dtype": "fp8", "model": "claude-sonnet-4-20250514", "n_agents": 3, "starter_mode": "preset", "target_speedup": null}}
@@ -679,6 +773,68 @@ def _kernel_interview_turn(messages: list[dict[str, Any]], model: str = "") -> d
         except json.JSONDecodeError:
             pass
     return {"ok": True, "done": False, "assistant": text}
+
+
+_REVIEW_DEFAULT_RULES = """- Correctness: logic bugs, edge cases, wrong APIs, off-by-one, error handling.
+- Security: NO hardcoded secrets/tokens/keys; no injection; safe file/subprocess use.
+- Hygiene: no leftover debug prints, commented-out code, stray TODOs, dead code.
+- Tests: meaningful changes should add/keep tests; flag "claims tested" with no test.
+- Consistency: matches the surrounding code style and the project's skills."""
+
+
+def _run_worktree_review(
+    wt: Path, rules: str, skills: str, model: str = ""
+) -> dict[str, Any]:
+    """Bugbot-style review: run the logged-in host ``claude -p`` over a
+    worktree's diff against plain-English rules (falling back to the task's
+    skills). Returns ``{ok, review}`` markdown."""
+    diff = worktree_diff(wt)
+    files = diff.get("files", [])
+    if not files:
+        return {"ok": True, "review": "✅ No changes to review in this worktree.", "files": 0}
+    parts: list[str] = []
+    total = 0
+    for f in files:
+        patch = f.get("patch") or ""
+        if not patch:
+            continue
+        parts.append(patch)
+        total += len(patch)
+        if total > 60000:
+            parts.append("\n... (diff truncated for review) ...\n")
+            break
+    diff_text = "\n".join(parts).strip() or "(no textual diff)"
+    rules_block = (rules or "").strip() or (skills or "").strip() or "(use general best practices)"
+    prompt = (
+        "You are a strict senior code reviewer (think Bugbot). Review the DIFF "
+        "for this change. Only flag real problems. For each finding, output a "
+        "markdown bullet exactly like:\n"
+        "  - `path:line` - **[severity]** what's wrong -> concrete fix\n"
+        "Always cover: correctness/bugs, security (secrets, injection), leftover "
+        "debug/TODO/dead code, missing or weak tests, and any RULES violations. "
+        "If everything looks good, reply with exactly: `✅ No issues found.` "
+        "Keep it concise.\n\n"
+        f"RULES (plain-English, from the user / task skills):\n{rules_block}\n\n"
+        f"DEFAULT CHECKLIST:\n{_REVIEW_DEFAULT_RULES}\n\n"
+        f"DIFF:\n{diff_text}"
+    )
+    cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "review timed out"}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    text = (proc.stdout or "").strip()
+    if not text:
+        return {
+            "ok": False,
+            "error": "empty response from claude",
+            "stderr": (proc.stderr or "")[-500:],
+        }
+    return {"ok": True, "review": text, "files": len(files)}
 
 
 # --- Claude prompt builder --------------------------------------------------
@@ -741,8 +897,8 @@ ONLY task-state file - do not create other status files.
 """
     return f"""You are running Loom's {agent_label(meta.agent)} pane for this task.
 
-You are in the task directory:
-{td}
+You start in this task's work directory (your git worktree is a subdirectory here - cd into it to touch code):
+{td / "work"}
 
 General goal:
 {meta.general_goal}
@@ -788,6 +944,28 @@ Begin by reading {plan_path}, then either ask the first interview
 question or, if PLAN.md is already detailed enough, acknowledge that it is
 ready and wait for the user to run ``/goal``.
 """
+
+
+def _task_pane_cwd(project_root: Path, slug: str, meta=None) -> Path:
+    """Directory the agent pane launches in - and where Claude Code stores the
+    session transcript (``~/.claude/projects/<encoded-cwd>/``).
+
+    All tasks launch in the task's ``work/`` dir: a stable base that holds every
+    git worktree (the agent cd's into the relevant one to run git / code), so
+    the session-transcript location stays consistent no matter how many
+    worktrees a task has. Falls back to the primary worktree / task dir only if
+    ``work/`` can't be created.
+    """
+    td = task_root(project_root, slug)
+    wd = td / "work"
+    try:
+        wd.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    if wd.is_dir():
+        return wd
+    wt = task_worktree_path(project_root, slug)
+    return wt if wt is not None else td
 
 
 # --- Claude tmux registry ---------------------------------------------------
@@ -836,8 +1014,7 @@ class ClaudeRegistry:
 
         # Run the agent inside the worktree when we have one - that's where
         # the user will eventually want /goal (or codex's equivalent) to act.
-        worktree = task_worktree_path(project_root, slug)
-        cwd = worktree if worktree is not None else td
+        cwd = _task_pane_cwd(project_root, slug, meta)
 
         agent = normalize_agent(meta.agent)
         session_name = _safe_claude_session_name(project_id, slug, agent)
@@ -1249,7 +1426,9 @@ class _TaskMonitor:
     @staticmethod
     def _tail_snippet(text: str) -> str:
         lines = [ln.rstrip() for ln in (text or "").splitlines() if ln.strip()]
-        return "\n".join(lines[-12:]).strip()[-600:]
+        # Carry a generous chunk of the final output so OpenClaw can actually
+        # summarize what the agent just did, not just the last couple of lines.
+        return "\n".join(lines[-60:]).strip()[-5000:]
 
     def _fire(self, pane_text: str) -> None:
         now = time.time()
@@ -1264,8 +1443,10 @@ class _TaskMonitor:
             self.manager.openclaw.emit(
                 "agent-stopped",
                 instruction=(
-                    f"Loom: the agent in task {self.slug} stopped and is waiting "
-                    f"for input. Reply to this message to continue it."
+                    f"Loom: the agent in task {self.slug} just stopped and is "
+                    f"waiting for input. Its recent terminal output is in "
+                    f"data.tail below — summarize for me what it just did / "
+                    f"finished, then I can reply to this message to continue it."
                 ),
                 project_root=self.project_root,
                 task_slug=self.slug,
@@ -1414,6 +1595,25 @@ def make_handler(
             self.end_headers()
             self.wfile.write(body)
 
+        @staticmethod
+        def _kill_pty(proc, master) -> None:
+            """Detach the tmux attach client + close its PTY (terminal stream)."""
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                os.close(master)
+            except Exception:
+                pass
+
         def _resolve_scope(self, parsed) -> tuple[Path | None, str | None]:
             qs = parse_qs(parsed.query or "")
             qpid = (qs.get("project") or [""])[0].strip()
@@ -1466,26 +1666,36 @@ def make_handler(
 
         def _claude_session_summary(self, project_id: str, slug: str, meta) -> dict[str, Any]:
             agent = normalize_agent(meta.agent)
-            cwd_str = (meta.worktree_path or "").strip() or str(task_root(pr.get_path(project_id), slug))
-            try:
-                cwd = Path(cwd_str)
-            except OSError:
-                cwd = Path(cwd_str)
+            root = pr.get_path(project_id)
+            # A session can live under the current pane cwd (work/) OR under any
+            # worktree where a pane was historically launched. Scan them all so
+            # Resume finds every session this task ever spawned.
+            candidates: list[Path] = []
+            for c in (
+                _task_pane_cwd(root, slug, meta),
+                *list_task_worktrees(root, slug),
+                task_root(root, slug),
+            ):
+                if c and c not in candidates:
+                    candidates.append(c)
             files_by_id: dict[str, dict[str, Any]] = {}
-            for p in list_session_files(cwd, agent):
-                sid = session_id_from_path(p, agent)
-                if not sid:
-                    continue
-                try:
-                    stat = p.stat()
-                except OSError:
-                    continue
-                files_by_id[sid] = {
-                    "id": sid,
-                    "path": str(p),
-                    "mtime": stat.st_mtime,
-                    "size": stat.st_size,
-                }
+            for cwd in candidates:
+                for p in list_session_files(cwd, agent):
+                    sid = session_id_from_path(p, agent)
+                    if not sid:
+                        continue
+                    try:
+                        stat = p.stat()
+                    except OSError:
+                        continue
+                    prev = files_by_id.get(sid)
+                    if prev is None or stat.st_mtime >= prev.get("mtime", 0.0):
+                        files_by_id[sid] = {
+                            "id": sid,
+                            "path": str(p),
+                            "mtime": stat.st_mtime,
+                            "size": stat.st_size,
+                        }
             # Preserve task-meta order (history of who-was-spawned-when)
             # but enrich with on-disk info.
             ordered = []
@@ -1640,6 +1850,74 @@ def make_handler(
                 ok, text = capture_pane(target, lines)
                 st, b, h = _json_bytes({"ok": ok, "text": text if ok else "", "error": "" if ok else text})
                 self._send(st, b, h)
+                return
+
+            if path == "/api/tmux/stream":
+                import select as _select
+
+                qs = parse_qs(parsed.query or "")
+                target = (qs.get("target") or [""])[0].strip()
+                try:
+                    cols = int((qs.get("cols") or ["80"])[0] or 80)
+                    rows = int((qs.get("rows") or ["24"])[0] or 24)
+                except ValueError:
+                    cols, rows = 80, 24
+                if not validate_tmux_target(target):
+                    st, b, h = _json_bytes({"ok": False, "error": "invalid target"}, 400)
+                    self._send(st, b, h)
+                    return
+                proc, master = open_pane_attach(target, cols, rows)
+                if proc is None or master is None:
+                    st, b, h = _json_bytes(
+                        {"ok": False, "error": "could not attach to pane"}, 502
+                    )
+                    self._send(st, b, h)
+                    return
+                self.close_connection = True
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                except OSError:
+                    self._kill_pty(proc, master)
+                    return
+                conn = self.connection
+                try:
+                    while True:
+                        if proc.poll() is not None:
+                            try:
+                                while True:
+                                    data = os.read(master, 65536)
+                                    if not data:
+                                        break
+                                    self.wfile.write(data)
+                            except OSError:
+                                pass
+                            break
+                        r, _, _ = _select.select([master, conn], [], [], 30)
+                        if conn in r:
+                            try:
+                                probe = conn.recv(4096)
+                            except OSError:
+                                probe = b""
+                            if not probe:
+                                break  # client closed the stream
+                        if master in r:
+                            try:
+                                data = os.read(master, 65536)
+                            except OSError:
+                                break
+                            if not data:
+                                break
+                            self.wfile.write(data)
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    self._kill_pty(proc, master)
                 return
 
             if path == "/api/tasks":
@@ -1934,10 +2212,12 @@ def make_handler(
                 plugin = str(body.get("plugin", "")).strip()
                 target = str(body.get("target", "")).strip()
                 model = str(body.get("model", "")).strip()
-                shape = body.get("shape", "")
-                if not plugin or not target or not model or not shape:
+                # Shape is optional: an explicit override when given, otherwise an
+                # agent proposes one at launch (see _launch_kernel_run).
+                shape = body.get("shape")
+                if not plugin or not target or not model:
                     st, b, h = _json_bytes(
-                        {"error": "plugin, target, model and shape are required"}, 400
+                        {"error": "plugin, target and model are required"}, 400
                     )
                     self._send(st, b, h)
                     return
@@ -1946,7 +2226,7 @@ def make_handler(
                     "plugin": plugin,
                     "target": target,
                     "model": model,
-                    "shape": shape,
+                    "shape": shape if shape else None,
                     "n_agents": int(body.get("n_agents", 1) or 1),
                     "starter_mode": str(body.get("starter_mode", "none") or "none"),
                     "target_speedup": body.get("target_speedup"),
@@ -2104,7 +2384,10 @@ def make_handler(
                     title,
                     general_goal,
                     skills_path=skills_path,
-                    interview_model=str(body.get("interview_model", "")),
+                    interview_model=(
+                        str(body.get("interview_model", "")).strip()
+                        or agent_default_model(raw_agent or AGENT_CLAUDE)
+                    ),
                     agent=raw_agent or AGENT_CLAUDE,
                     kind={"kernel": "kernel", "aris": "aris"}.get(
                         str(body.get("kind", "")).strip().lower(), "agent"
@@ -2167,6 +2450,42 @@ def make_handler(
                 target = str(body.get("target", "")).strip()
                 key = str(body.get("key", "")).strip()
                 ok, msg = send_pane_key(target, key)
+                st, b, h = (
+                    _json_bytes({"ok": True})
+                    if ok
+                    else _json_bytes({"ok": False, "error": msg}, 400)
+                )
+                self._send(st, b, h)
+                return
+
+            if path == "/api/tmux/send-literal":
+                target = str(body.get("target", "")).strip()
+                text = body.get("text", "")
+                if not isinstance(text, str):
+                    st, b, h = _json_bytes({"ok": False, "error": "text must be string"}, 400)
+                    self._send(st, b, h)
+                    return
+                ok, msg = send_pane_literal(target, text)
+                st, b, h = (
+                    _json_bytes({"ok": True})
+                    if ok
+                    else _json_bytes({"ok": False, "error": msg}, 400)
+                )
+                self._send(st, b, h)
+                return
+
+            if path == "/api/tmux/scroll":
+                target = str(body.get("target", "")).strip()
+                direction = str(body.get("dir", "up")).strip()
+                try:
+                    lines = int(body.get("lines", 3))
+                except (TypeError, ValueError):
+                    lines = 3
+                if not validate_tmux_target(target):
+                    st, b, h = _json_bytes({"ok": False, "error": "invalid target"}, 400)
+                    self._send(st, b, h)
+                    return
+                ok, msg = scroll_pane(target, direction, lines)
                 st, b, h = (
                     _json_bytes({"ok": True})
                     if ok
@@ -2528,6 +2847,102 @@ def make_handler(
                     flush=True,
                 )
                 st, b, h = _json_bytes(result, 200 if result.get("ok") else 400)
+                self._send(st, b, h)
+                return
+
+            m_wt_merge = re.match(r"^/api/tasks/([^/]+)/worktree/merge$", path)
+            if m_wt_merge:
+                root, project_id = self._resolve_scope(parsed)
+                if root is None or project_id is None:
+                    self._bad_project()
+                    return
+                slug = m_wt_merge.group(1)
+                if not _SLUG_RE.match(slug):
+                    st, b, h = _json_bytes({"error": "invalid slug"}, 400)
+                    self._send(st, b, h)
+                    return
+                meta = read_meta(root, slug)
+                if not meta:
+                    st, b, h = _json_bytes({"error": "not found"}, 404)
+                    self._send(st, b, h)
+                    return
+                raw_path = str(body.get("path", "")).strip()
+                if not raw_path:
+                    st, b, h = _json_bytes({"error": "path required"}, 400)
+                    self._send(st, b, h)
+                    return
+                try:
+                    wt = Path(raw_path).expanduser().resolve()
+                except OSError as exc:
+                    st, b, h = _json_bytes({"error": f"invalid path: {exc}"}, 400)
+                    self._send(st, b, h)
+                    return
+                if str(wt) not in meta.worktrees:
+                    st, b, h = _json_bytes(
+                        {"error": "worktree is not registered with this task"}, 400
+                    )
+                    self._send(st, b, h)
+                    return
+                result = merge_worktree_to_base(wt)
+                print(
+                    f"[web] merge worktree slug={slug} path={wt} "
+                    f"ok={result.get('ok')} {result.get('branch')}->{result.get('base')}",
+                    flush=True,
+                )
+                st, b, h = _json_bytes(result, 200 if result.get("ok") else 400)
+                self._send(st, b, h)
+                return
+
+            m_review = re.match(r"^/api/tasks/([^/]+)/review$", path)
+            if m_review:
+                root, project_id = self._resolve_scope(parsed)
+                if root is None or project_id is None:
+                    self._bad_project()
+                    return
+                slug = m_review.group(1)
+                if not _SLUG_RE.match(slug):
+                    st, b, h = _json_bytes({"error": "invalid slug"}, 400)
+                    self._send(st, b, h)
+                    return
+                meta = read_meta(root, slug)
+                if not meta:
+                    st, b, h = _json_bytes({"error": "not found"}, 404)
+                    self._send(st, b, h)
+                    return
+                raw_path = str(body.get("path", "")).strip()
+                if not raw_path:
+                    st, b, h = _json_bytes({"error": "path required"}, 400)
+                    self._send(st, b, h)
+                    return
+                try:
+                    wt = Path(raw_path).expanduser().resolve()
+                except OSError as exc:
+                    st, b, h = _json_bytes({"error": f"invalid path: {exc}"}, 400)
+                    self._send(st, b, h)
+                    return
+                if str(wt) not in meta.worktrees:
+                    st, b, h = _json_bytes(
+                        {"error": "worktree is not registered with this task"}, 400
+                    )
+                    self._send(st, b, h)
+                    return
+                skills_text = ""
+                sp = Path(meta.skills_path).expanduser() if meta.skills_path else None
+                if sp is None or not sp.is_file():
+                    sp = default_skills if default_skills.is_file() else bundled_skills_path()
+                if sp.is_file():
+                    skills_text = sp.read_text(encoding="utf-8", errors="replace")[:8000]
+                result = _run_worktree_review(
+                    wt,
+                    str(body.get("rules", "")),
+                    skills_text,
+                    model=meta.interview_model or "",
+                )
+                print(
+                    f"[web] review worktree slug={slug} path={wt} ok={result.get('ok')}",
+                    flush=True,
+                )
+                st, b, h = _json_bytes(result, 200 if result.get("ok") else 502)
                 self._send(st, b, h)
                 return
 
