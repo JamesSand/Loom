@@ -6,7 +6,7 @@
   <title>Loom</title>
   <link rel="icon" type="image/png" href="/static/loom-logo.png" />
   <link rel="stylesheet" href="/static/vendor/xterm.css?v=5.5.0" />
-  <link rel="stylesheet" href="/static/app.css?v=20260621-35" />
+  <link rel="stylesheet" href="/static/app.css?v=20260629-2" />
 </head>
 <body>
   <header class="topbar">
@@ -175,6 +175,7 @@
             <div class="interview-md-bar">
               <label for="interview-md-select" class="interview-md-bar__label">Viewing</label>
               <select id="interview-md-select" class="interview-md-select" aria-label="Top-level markdown file to view"></select>
+              <button type="button" class="btn btn--sm" id="interview-md-save" hidden>Save</button>
               <span class="tab-panel__hint interview-md-bar__hint" id="interview-md-hint">Read-only preview. Pick any scanned Markdown file.</span>
             </div>
             <div class="markdown-workbench markdown-workbench--interview">
@@ -348,7 +349,7 @@
       <div class="modal-card__header">
         <div>
           <h2 id="worktree-modal-title">Create worktree</h2>
-          <p>Pick a git repo to base the task's worktree on. The new branch is <code id="wt-modal-branch">zhongzhu/…</code>; the worktree lands at <code id="wt-modal-dest">…/work/&lt;repo&gt;/</code>.</p>
+          <p>Pick a git repo to base the task's worktree on. The new branch is <code id="wt-modal-branch">zhizhou/…</code>; the worktree lands at <code id="wt-modal-dest">…/work/&lt;repo&gt;/</code>.</p>
         </div>
         <button type="button" class="icon-btn" id="btn-wt-close" aria-label="Close">×</button>
       </div>
@@ -432,6 +433,6 @@
 
   <script src="/static/vendor/xterm.js?v=5.5.0"></script>
   <script src="/static/vendor/addon-fit.js?v=0.10.0"></script>
-  <script src="/static/app.js?v=20260621-35"></script>
+  <script src="/static/app.js?v=20260629-4"></script>
 </body>
 </html>

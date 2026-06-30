@@ -4,7 +4,7 @@ Three concerns after the agent-loop rewrite:
 
 1. **Task CRUD** - list / create / delete tasks (``<project>/.RUD/<slug>/``).
    Each new task auto-creates a git worktree at
-   ``<task>/work/<repo>`` on branch ``zhongzhu/<slug>`` (best-effort -
+   ``<task>/work/<repo>`` on branch ``zhizhou/<slug>`` (best-effort -
    non-git project roots just skip the worktree step).
 2. **Project notes** - one ``<project>/.RUD/NOTES.md`` per project,
    served by ``GET/PUT /api/notes``.
@@ -69,6 +69,7 @@ from loom.rud_task import (
     read_task_markdown_file,
     read_task_monitor,
     read_template,
+    NOTE,
     remove_task_worktree,
     reorder_tasks,
     rename_task_meta,
@@ -1867,7 +1868,7 @@ def make_handler(
                         "projectRoot": str(root),
                         "projectId": pid,
                         "skillsPath": str(sk),
-                        "skillsBundledRelative": "loom/skills/charlie_skills.md",
+                        "skillsBundledRelative": "loom/skills/zhizhou_skills.md",
                         "skillsOptions": _available_skill_options(sk, root),
                     }
                 )
@@ -2333,6 +2334,10 @@ def make_handler(
                         templates[PLAN] = read_template(root, slug, PLAN) or ""
                         if PLAN not in md_names:
                             md_names = [PLAN, *md_names]
+                    if NOTE not in templates:
+                        templates[NOTE] = read_template(root, slug, NOTE) or ""
+                        if NOTE not in md_names:
+                            md_names = [*md_names, NOTE]
                     statuses = statuses_fut.result()
                     summary = summary_fut.result() if summary_fut is not None else None
                 st, b, h = _json_bytes(

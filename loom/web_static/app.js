@@ -13,7 +13,13 @@
 
 const FILES = {
   plan: 'PLAN.md',
+  note: 'NOTE.md',
 };
+
+// Files editable in-place from the embedded Markdown panel (Save button).
+// Everything else scanned from the task dir stays read-only.
+const EDITABLE_TEMPLATES = [FILES.plan, FILES.note];
+function isEditableMd(name) { return EDITABLE_TEMPLATES.includes(name); }
 
 // "interview" is the embedded read-only Markdown viewer on the agent pane.
 const MARKDOWN_PANELS = ['interview'];
@@ -70,9 +76,12 @@ const STATE = {
   // Embedded read-only markdown viewer on the Claude tab. The picker
   // lets the user flip between any top-level *.md file in the task root;
   // PLAN.md is the default.
-  interviewMdFile: FILES.plan,
+  interviewMdFile: FILES.note,
   interviewMdFiles: [],
   interviewMdContents: {},
+  // True when the editor holds unsaved edits for the current editable file,
+  // so background polling won't clobber in-progress typing.
+  interviewMdDirty: false,
   // Changes tab: cached diff payload + which file is selected.
   changesData: null,
   changesSelected: '',
@@ -733,15 +742,60 @@ function initMarkdownPreviews() {
     const editor = $(`#editor-${which}`);
     if (!editor) return;
     editor.addEventListener('input', () => {
+      // Editing an editable file (PLAN.md / NOTE.md) marks it dirty so polling
+      // won't overwrite in-progress edits, and stashes the live text.
+      if (which === 'interview' && isEditableMd(STATE.interviewMdFile)) {
+        STATE.interviewMdDirty = true;
+        STATE.interviewMdContents[STATE.interviewMdFile] = editor.value;
+      }
       if (STATE.previewDebounce[which]) cancelAnimationFrame(STATE.previewDebounce[which]);
       STATE.previewDebounce[which] = requestAnimationFrame(() => {
         STATE.previewDebounce[which] = 0;
         updateMarkdownPreview(which, true);
       });
     });
+    // Keep the raw editor and the rendered preview scrolled to the same
+    // relative position: dragging either side moves the other proportionally.
+    const preview = $(`#preview-${which}`);
+    if (preview) linkScrollSync(editor, preview);
   });
+  const mdSave = document.getElementById('interview-md-save');
+  if (mdSave) mdSave.addEventListener('click', saveInterviewMd);
   updateActiveMarkdownPreview();
   injectMarkdownViewSwitchers();
+}
+
+// Two-way proportional scroll sync between two scroll containers. A shared
+// lock (released on the next frame) swallows the echo scroll event that
+// setting scrollTop fires, so the two don't fight each other.
+function linkScrollSync(a, b) {
+  let locked = false;
+  const mirror = (from, to) => {
+    if (locked) return;
+    locked = true;
+    const range = from.scrollHeight - from.clientHeight;
+    const frac = range > 0 ? from.scrollTop / range : 0;
+    to.scrollTop = frac * (to.scrollHeight - to.clientHeight);
+    requestAnimationFrame(() => { locked = false; });
+  };
+  a.addEventListener('scroll', () => mirror(a, b), { passive: true });
+  b.addEventListener('scroll', () => mirror(b, a), { passive: true });
+}
+
+// Save the currently-selected editable Markdown file (PLAN.md / NOTE.md).
+async function saveInterviewMd() {
+  const name = STATE.interviewMdFile;
+  if (!isEditableMd(name)) return;
+  const editor = document.getElementById('editor-interview');
+  if (!editor) return;
+  STATE.interviewMdContents[name] = editor.value;
+  await saveTemplate(name, '#editor-interview', null);
+  STATE.interviewMdDirty = false;
+  const hint = document.getElementById('interview-md-hint');
+  if (hint) {
+    hint.textContent = `Saved ${name}.`;
+    setTimeout(updateInterviewMdHint, 2000);
+  }
 }
 
 function injectMarkdownViewSwitchers() {
@@ -786,7 +840,7 @@ function previewTitle(which) {
   // embedded read-only viewer on the Claude tab.
   const names = {
     notes: 'NOTES.md',
-    interview: STATE.interviewMdFile || 'PLAN.md',
+    interview: STATE.interviewMdFile || 'NOTE.md',
   };
   const taskTitle = $('#task-title')?.textContent?.trim() || 'Task';
   return `${names[which] || 'Preview'} · ${taskTitle}`;
@@ -803,7 +857,7 @@ function applyInterviewMdPayload(d) {
     : '';
   let files = Array.isArray(d.task_markdown_files) && d.task_markdown_files.length
     ? d.task_markdown_files.slice()
-    : [FILES.plan];
+    : [FILES.plan, FILES.note];
   if (!files.includes(FILES.plan)) files = [FILES.plan, ...files];
   const contents = {};
   for (const name of files) {
@@ -815,10 +869,19 @@ function applyInterviewMdPayload(d) {
       contents[name] = '';
     }
   }
+  // Preserve unsaved edits to the current editable file across a poll
+  // refresh: keep the live editor text instead of the (stale) server copy.
+  if (STATE.interviewMdDirty && isEditableMd(STATE.interviewMdFile)) {
+    const editor = document.getElementById('editor-interview');
+    if (editor && Object.prototype.hasOwnProperty.call(contents, STATE.interviewMdFile)) {
+      contents[STATE.interviewMdFile] = editor.value;
+    }
+  }
   STATE.interviewMdFiles = files;
   STATE.interviewMdContents = contents;
   if (!files.includes(STATE.interviewMdFile)) {
-    STATE.interviewMdFile = FILES.plan;
+    STATE.interviewMdFile = files.includes(FILES.note) ? FILES.note : FILES.plan;
+    STATE.interviewMdDirty = false;
   }
   populateInterviewMdSelect();
   loadInterviewMdIntoEditor();
@@ -850,7 +913,14 @@ function populateInterviewMdSelect() {
 function onInterviewMdSelectChange(ev) {
   const name = ev.target.value;
   if (!name || !STATE.interviewMdFiles.includes(name)) return;
+  // Keep any unsaved edits to the file we're leaving so switching back
+  // doesn't lose them.
+  const editor = document.getElementById('editor-interview');
+  if (editor && STATE.interviewMdDirty && isEditableMd(STATE.interviewMdFile)) {
+    STATE.interviewMdContents[STATE.interviewMdFile] = editor.value;
+  }
   STATE.interviewMdFile = name;
+  STATE.interviewMdDirty = false;
   loadInterviewMdIntoEditor();
   updateInterviewMdHint();
 }
@@ -859,6 +929,11 @@ function loadInterviewMdIntoEditor() {
   const editor = document.getElementById('editor-interview');
   if (!editor) return;
   const name = STATE.interviewMdFile;
+  const editable = isEditableMd(name);
+  applyInterviewMdEditable();
+  // Don't overwrite the editor while the user has unsaved edits to an
+  // editable file - that would wipe their typing on the next poll.
+  if (editable && STATE.interviewMdDirty) return;
   const text = STATE.interviewMdContents[name] || '';
   const changed = editor.value !== text;
   if (changed) {
@@ -873,13 +948,23 @@ function loadInterviewMdIntoEditor() {
   }
 }
 
+// Reflect the current file's editability in the editor + Save button.
+function applyInterviewMdEditable() {
+  const editor = document.getElementById('editor-interview');
+  const saveBtn = document.getElementById('interview-md-save');
+  const editable = isEditableMd(STATE.interviewMdFile);
+  if (editor) editor.readOnly = !editable;
+  if (saveBtn) saveBtn.hidden = !editable;
+}
+
 function updateInterviewMdHint() {
   const hint = document.getElementById('interview-md-hint');
   if (!hint) return;
-  if (STATE.interviewMdFile === FILES.plan) {
-    hint.textContent = 'Read-only preview of PLAN.md.';
+  const name = STATE.interviewMdFile;
+  if (isEditableMd(name)) {
+    hint.textContent = `Editable. Edit ${name} and click Save.`;
   } else {
-    hint.textContent = `Read-only preview of ${STATE.interviewMdFile}.`;
+    hint.textContent = `Read-only preview of ${name}.`;
   }
 }
 
@@ -1872,6 +1957,9 @@ function ensureTerminal() {
   // doesn't fire dozens of requests.
   let scrollAccum = 0;
   let scrollTimer = null;
+  // Wheel sensitivity: pixels of wheel travel per tmux scrollback line.
+  // Bigger = less sensitive (slower scrolling). Was 24 (~4 lines per notch).
+  const SCROLL_PX_PER_LINE = 90;
   function termScrollBy(dy) {
     if (!TERM.connected || !termTarget()) return;
     scrollAccum += dy;
@@ -1879,7 +1967,7 @@ function ensureTerminal() {
     scrollTimer = setTimeout(() => {
       const total = scrollAccum; scrollAccum = 0; scrollTimer = null;
       if (!total) return;
-      const lines = Math.max(1, Math.min(80, Math.round(Math.abs(total) / 24)));
+      const lines = Math.max(1, Math.min(80, Math.round(Math.abs(total) / SCROLL_PX_PER_LINE)));
       api('/api/tmux/scroll', {
         method: 'POST',
         body: JSON.stringify({ target: termTarget(), dir: total < 0 ? 'up' : 'down', lines }),
@@ -1892,6 +1980,41 @@ function ensureTerminal() {
     e.stopPropagation();
     termScrollBy(e.deltaMode === 1 ? e.deltaY * 18 : e.deltaY);
   }, { passive: false, capture: true });
+  // ▲/▼ scroll buttons. One press = one step (~one PgUp for full-screen apps);
+  // press-and-hold repeats. Bound here so they share termTarget()/TERM.connected.
+  function termScrollStep(dir) {
+    if (!TERM.connected || !termTarget()) return;
+    api('/api/tmux/scroll', {
+      method: 'POST',
+      body: JSON.stringify({ target: termTarget(), dir, lines: 8 }),
+    }).catch(() => {});
+  }
+  if (!host.querySelector('.term-scrollbar')) {
+    const bar = document.createElement('div');
+    bar.className = 'term-scrollbar';
+    bar.innerHTML =
+      '<button type="button" class="term-scrollbar__btn" data-dir="up" title="Scroll up (hold to keep scrolling)" aria-label="Scroll up">▲</button>'
+      + '<button type="button" class="term-scrollbar__btn" data-dir="down" title="Scroll down (hold to keep scrolling)" aria-label="Scroll down">▼</button>';
+    host.appendChild(bar);
+    bar.querySelectorAll('.term-scrollbar__btn').forEach((btn) => {
+      const dir = btn.dataset.dir;
+      let holdTimer = null;
+      let repeatTimer = null;
+      const stop = () => {
+        if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+        if (repeatTimer) { clearInterval(repeatTimer); repeatTimer = null; }
+      };
+      btn.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        termScrollStep(dir);
+        holdTimer = setTimeout(() => {
+          repeatTimer = setInterval(() => termScrollStep(dir), 180);
+        }, 350);
+      });
+      ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => btn.addEventListener(ev, stop));
+    });
+  }
   // Touch (phones/tablets): a single-finger drag scrolls tmux scrollback the
   // same way the wheel does. A long-press (finger held still) instead arms text
   // selection, where the following drag is translated into xterm's own mouse
@@ -3517,7 +3640,7 @@ async function openWorktreeModal() {
   const modal = $('#worktree-modal');
   if (!modal) return;
   modal.hidden = false;
-  $('#wt-modal-branch').textContent = `zhongzhu/${STATE.slug}`;
+  $('#wt-modal-branch').textContent = `zhizhou/${STATE.slug}`;
   $('#wt-modal-dest').textContent = `.RUD/${STATE.slug}/work/<repo>/`;
   const host = $('#wt-candidates');
   const status = $('#wt-status');

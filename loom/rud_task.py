@@ -10,7 +10,7 @@ Layout per project root::
             PLAN.md         # the only per-task markdown file - Claude reads
                             # and rewrites it; the user edits it via the
                             # PLAN.md tab and the embedded view on Claude tab
-            work/<repo>/    # auto-created git worktree (branch zhongzhu/<slug>)
+            work/<repo>/    # auto-created git worktree (branch zhizhou/<slug>)
 
 There is no worker / evaluator / runner anymore - the user drives Claude
 themselves via the tmux pane.  We do track which Claude session UUIDs each
@@ -36,13 +36,15 @@ RUD_DIR = ".RUD"
 WORK_SUBDIR = "work"
 
 PLAN = "PLAN.md"
+NOTE = "NOTE.md"
 NOTES = "NOTES.md"
 META = "task.json"
 TASK_ORDER = "task-order.json"
 
-# Only PLAN.md is editable through the per-task template API now.  NOTES.md
-# lives at the project root and has its own dedicated endpoint.
-ALLOWED_TEMPLATE_NAMES = frozenset({PLAN})
+# PLAN.md and the per-task NOTE.md are editable through the per-task template
+# API.  Project-scoped NOTES.md lives at the project root and has its own
+# dedicated endpoint.
+ALLOWED_TEMPLATE_NAMES = frozenset({PLAN, NOTE})
 
 # Supported agent CLIs that can drive a task's tmux pane.
 AGENT_CLAUDE = "claude"
@@ -296,10 +298,10 @@ def package_templates_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "templates"
 
 
-def copy_default_plan(dest_dir: Path, overwrite: bool = False) -> None:
-    """Seed PLAN.md from the shipped template if missing."""
-    src = package_templates_dir() / PLAN
-    out = dest_dir / PLAN
+def _copy_default_template(dest_dir: Path, name: str, overwrite: bool = False) -> None:
+    """Seed ``name`` from the shipped template if missing."""
+    src = package_templates_dir() / name
+    out = dest_dir / name
     if out.exists() and not overwrite:
         return
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +309,16 @@ def copy_default_plan(dest_dir: Path, overwrite: bool = False) -> None:
         out.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     else:
         out.write_text("", encoding="utf-8")
+
+
+def copy_default_plan(dest_dir: Path, overwrite: bool = False) -> None:
+    """Seed PLAN.md from the shipped template if missing."""
+    _copy_default_template(dest_dir, PLAN, overwrite=overwrite)
+
+
+def copy_default_note(dest_dir: Path, overwrite: bool = False) -> None:
+    """Seed NOTE.md from the shipped template if missing."""
+    _copy_default_template(dest_dir, NOTE, overwrite=overwrite)
 
 
 @dataclass
@@ -516,6 +528,7 @@ def create_task(
     root = task_root(project_root, slug)
     root.mkdir(parents=True, exist_ok=True)
     copy_default_plan(root, overwrite=False)
+    copy_default_note(root, overwrite=False)
     sk = (skills_path or bundled_skills_path()).expanduser().resolve()
     if not sk.is_file():
         sk = bundled_skills_path().resolve()
@@ -1296,9 +1309,9 @@ def git_toplevel(path: Path) -> Path | None:
 
 
 def _branch_name_for(slug: str) -> str:
-    # Per charlie_skills.md the user wants branches under zhongzhu/<slug>.
+    # Per charlie_skills.md the user wants branches under zhizhou/<slug>.
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", slug).strip("-") or "task"
-    return f"zhongzhu/{cleaned[:80]}"
+    return f"zhizhou/{cleaned[:80]}"
 
 
 def direct_child_git_repos(parent: Path) -> list[Path]:

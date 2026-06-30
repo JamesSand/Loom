@@ -92,7 +92,7 @@ def web_cmd(
     skills: Path = typer.Option(
         bundled_skills_path(),
         "--skills",
-        help="Default skills markdown for new tasks (package default: loom/skills/charlie_skills.md)",
+        help="Default skills markdown for new tasks (package default: loom/skills/zhizhou_skills.md)",
     ),
     daemon: bool = typer.Option(
         False,
